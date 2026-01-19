@@ -76,6 +76,12 @@ Work around TLS issues (not recommended):
 python3 sec_earnings_8k.py --ticker COST --insecure
 ```
 
+### Windows TLS troubleshooting
+
+If you see SSL verification errors on Windows, try one of these:
+- Run with `--ca-bundle` pointing to a PEM CA bundle.
+- As a last resort, run with `--insecure` (not recommended).
+
 ## Python script usage (Windows or macOS)
 
 Example: download SEC files for `COST` into a specified folder.
@@ -99,6 +105,14 @@ exit_code = fetch_latest_earnings_8k(
 )
 
 print("Done, exit code:", exit_code)
+```
+
+## Optional install (pip)
+
+You can install the module locally for easier imports:
+
+```bash
+pip install -e .
 ```
 
 ## Output layout
