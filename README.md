@@ -82,6 +82,20 @@ If you see SSL verification errors on Windows, try one of these:
 - Run with `--ca-bundle` pointing to a PEM CA bundle.
 - As a last resort, run with `--insecure` (not recommended).
 
+### macOS TLS troubleshooting (uv/venv)
+
+If TLS verification fails on macOS, your Python may not have a CA bundle.
+Quick fix using `certifi`:
+
+```bash
+uv pip install certifi
+python -c "import certifi; print(certifi.where())"
+python3 sec_earnings_8k.py --ticker COST --ca-bundle "$(python -c 'import certifi; print(certifi.where())')"
+```
+
+If you installed Python from python.org, you can also run the bundled
+`Install Certificates.command` in the Python Applications folder.
+
 ## Python script usage (Windows or macOS)
 
 Example: download SEC files for `COST` into a specified folder.
