@@ -1,0 +1,5 @@
+.DS_Store
+.venv/
+.uv-cache/
+__pycache__/
+sec_earnings_8k/
