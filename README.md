@@ -43,6 +43,8 @@ python3 sec_earnings_8k.py --ticker COST
 
 - `--ticker` (required): Company ticker symbol, e.g. `COST`.
 - `--date` (optional): Filing date filter in `YYYY-MM-DD`.
+- `--q` (optional): Fiscal quarter (1-4). Must be used with `--fy`.
+- `--fy` (optional): Fiscal year (YYYY). Must be used with `--q`.
 - `--outdir` (optional): Output directory (default: `./sec_earnings_8k`).
 - `--user-agent` (optional): SEC requires a User-Agent with contact info.
 - `--ca-bundle` (optional): Path to a CA bundle (PEM) if your system certs are missing.
@@ -54,6 +56,11 @@ python3 sec_earnings_8k.py --ticker COST
 Download latest earnings-related 8-K exhibits:
 ```bash
 python3 sec_earnings_8k.py --ticker COST
+```
+
+Include fiscal quarter/year for naming:
+```bash
+python3 sec_earnings_8k.py --ticker COST --q 4 --fy 2025
 ```
 
 Filter by a specific filing date:
@@ -116,6 +123,8 @@ exit_code = fetch_latest_earnings_8k(
     user_agent=user_agent,
     ssl_context=ssl.create_default_context(),
     save_pdf=False,
+    q=4,
+    fy=2025,
 )
 
 print("Done, exit code:", exit_code)
@@ -131,14 +140,21 @@ pip install -e .
 
 ## Output layout
 
-Each filing is stored in a folder like:
+If `--q`/`--fy` are provided, files are saved to a folder named:
 ```
-./sec_earnings_8k/COST_2025-12-11_0000909832-25-000164/
+COST_Q4_2025/
+```
+
+If `--q`/`--fy` are omitted, files are saved to:
+```
+./sec_earnings_8k/COST/
 ```
 
 Inside the folder:
-- `EX-99.1_*.htm`
-- `EX-99.2_*.htm`
-- `PRIOR_10Q_*` or `PRIOR_10K_*` (the most recent report before the 8-K)
+- `cost_q4_2025_8k_991.htm` / `cost_q4_2025_8k_991.pdf`
+- `cost_q4_2025_8k_992.htm` / `cost_q4_2025_8k_992.pdf`
+- `cost_q3_2025_10q.htm` / `cost_q3_2025_10q.pdf`
 - `img/` (linked images referenced by the HTML)
-- `EX-99.*.pdf` (only if `--pdf` is used)
+
+If `--q`/`--fy` are omitted, the filenames drop the quarter/year prefix:
+- `cost_8k_991.htm`, `cost_8k_992.htm`, `cost_10q.htm` (or `cost_10k.htm`)

@@ -261,6 +261,42 @@ def _convert_html_to_pdf(html_path: str, pdf_path: str) -> None:
     )
 
 
+def _validate_quarter_inputs(q: Optional[int], fy: Optional[int]) -> Optional[tuple[int, int]]:
+    if q is None and fy is None:
+        return None
+    if q is None or fy is None:
+        raise ValueError("Both --q and --fy must be provided together.")
+    if q not in {1, 2, 3, 4}:
+        raise ValueError("--q must be 1, 2, 3, or 4.")
+    if fy < 1900:
+        raise ValueError("--fy must be a 4-digit year.")
+    return q, fy
+
+
+def _folder_name(ticker: str, q: Optional[int], fy: Optional[int]) -> str:
+    if q is None or fy is None:
+        return _normalize_ticker(ticker)
+    return f"{_normalize_ticker(ticker)}_Q{q}_{fy}"
+
+
+def _file_prefix(ticker: str, q: Optional[int], fy: Optional[int]) -> str:
+    ticker_norm = _normalize_ticker(ticker).lower()
+    if q is None or fy is None:
+        return f"{ticker_norm}_"
+    return f"{ticker_norm}_q{q}_{fy}_"
+
+
+def _prior_quarter_label(q: int, fy: int) -> tuple[int, int, str]:
+    if q == 1:
+        prev_q = 4
+        prev_fy = fy - 1
+    else:
+        prev_q = q - 1
+        prev_fy = fy
+    label = "10k" if prev_q == 4 else "10q"
+    return prev_q, prev_fy, label
+
+
 def fetch_latest_earnings_8k(
     ticker: str,
     date_filter: Optional[str],
@@ -268,6 +304,8 @@ def fetch_latest_earnings_8k(
     user_agent: str,
     ssl_context: Optional[ssl.SSLContext],
     save_pdf: bool,
+    q: Optional[int] = None,
+    fy: Optional[int] = None,
 ) -> int:
     cik = _ticker_to_cik(ticker, user_agent, ssl_context)
     submissions_url = SEC_SUBMISSIONS_URL.format(cik=cik)
@@ -296,14 +334,16 @@ def fetch_latest_earnings_8k(
         saved = []
         ex99_1_paths: list[str] = []
         base_url = f"{SEC_ARCHIVES_BASE}/{int(cik)}/{accession_nodash}"
-        safe_ticker = _normalize_ticker(ticker)
-        out_base = os.path.join(outdir, f"{safe_ticker}_{candidate['filing_date']}_{accession}")
+        out_base = os.path.join(outdir, _folder_name(ticker, q, fy))
+        file_prefix = _file_prefix(ticker, q, fy)
 
         for ex_code, filename in exhibits.items():
             if not filename:
                 continue
             url = f"{base_url}/{filename}"
-            dest_path = os.path.join(out_base, f"{ex_code}_{filename}")
+            ext = os.path.splitext(filename)[1] or ".htm"
+            ex_suffix = "991" if ex_code == "EX-99.1" else "992"
+            dest_path = os.path.join(out_base, f"{file_prefix}8k_{ex_suffix}{ext}")
             _download_file(url, dest_path, user_agent, ssl_context)
             saved.append(dest_path)
             if ex_code == "EX-99.1":
@@ -331,9 +371,11 @@ def fetch_latest_earnings_8k(
             report_accession_nodash = report_accession.replace("-", "")
             report_base_url = f"{SEC_ARCHIVES_BASE}/{int(cik)}/{report_accession_nodash}"
             report_doc = prior_report["primary_document"]
-            report_form = prior_report["form"].replace("-", "")
-            report_name = f"PRIOR_{report_form}_{prior_report['filing_date']}_{report_doc}"
-            report_path = os.path.join(out_base, report_name)
+            report_ext = os.path.splitext(report_doc)[1] or ".htm"
+            report_label = prior_report["form"].replace("-", "").lower()
+            if q is not None and fy is not None:
+                _, _, report_label = _prior_quarter_label(q, fy)
+            report_path = os.path.join(out_base, f"{file_prefix}{report_label}{report_ext}")
             report_url = f"{report_base_url}/{report_doc}"
             _download_file(report_url, report_path, user_agent, ssl_context)
             saved.append(report_path)
@@ -379,6 +421,18 @@ def main() -> int:
         default=None,
     )
     parser.add_argument(
+        "--q",
+        type=int,
+        help="Optional fiscal quarter (1-4). Must be used with --fy.",
+        default=None,
+    )
+    parser.add_argument(
+        "--fy",
+        type=int,
+        help="Optional fiscal year (YYYY). Must be used with --q.",
+        default=None,
+    )
+    parser.add_argument(
         "--outdir",
         help=f"Directory to save files (default: {DEFAULT_OUTDIR}).",
         default=DEFAULT_OUTDIR,
@@ -406,6 +460,9 @@ def main() -> int:
     args = parser.parse_args()
 
     date_filter = _date_or_none(args.date)
+    quarter_info = _validate_quarter_inputs(args.q, args.fy)
+    q = quarter_info[0] if quarter_info else None
+    fy = quarter_info[1] if quarter_info else None
 
     ssl_context: Optional[ssl.SSLContext]
     if args.insecure:
@@ -421,6 +478,8 @@ def main() -> int:
             user_agent=args.user_agent,
             ssl_context=ssl_context,
             save_pdf=args.pdf,
+            q=q,
+            fy=fy,
         )
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(exc):
