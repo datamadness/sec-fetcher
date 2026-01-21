@@ -76,15 +76,13 @@ def _is_earnings_related(items: str) -> bool:
 
 
 def _matches_exhibit(name: str, ex_code: str) -> bool:
-    name_norm = name.lower()
-    ex_code_norm = ex_code.lower().replace(".", "")
+    name_norm = re.sub(r"[^a-z0-9]", "", name.lower())
+    ex_code_norm = re.sub(r"[^a-z0-9]", "", ex_code.lower())
     patterns = [
         ex_code_norm,
-        ex_code_norm.replace("ex", "ex-"),
-        ex_code_norm.replace("ex", "ex_"),
         ex_code_norm.replace("ex", "exhibit"),
     ]
-    return any(p in name_norm.replace(".", "").replace("-", "").replace("_", "") for p in patterns)
+    return any(p in name_norm for p in patterns)
 
 
 def _find_exhibit_files(index_json: dict) -> dict:
