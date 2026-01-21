@@ -189,6 +189,20 @@ def _download_file(
         f.write(data)
 
 
+def _acceptance_datetime(accession: str, base_url: str, user_agent: str, ssl_context: Optional[ssl.SSLContext]) -> Optional[str]:
+    url = f"{base_url}/{accession}.txt"
+    try:
+        data = _http_get(url, user_agent, ssl_context)
+    except urllib.error.HTTPError:
+        return None
+    text = data.decode("utf-8", errors="replace")
+    match = re.search(r"ACCEPTANCE-DATETIME[>:]\s*(\d{14})", text)
+    if not match:
+        return None
+    raw = match.group(1)
+    return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}T{raw[8:10]}:{raw[10:12]}:{raw[12:14]}"
+
+
 class _ImageSrcParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -335,6 +349,20 @@ def fetch_latest_earnings_8k(
         base_url = f"{SEC_ARCHIVES_BASE}/{int(cik)}/{accession_nodash}"
         out_base = os.path.join(outdir, _folder_name(ticker, q, fy))
         file_prefix = _file_prefix(ticker, q, fy)
+        os.makedirs(out_base, exist_ok=True)
+        sec_filing_dt = _acceptance_datetime(accession, base_url, user_agent, ssl_context)
+        meta_path = os.path.join(out_base, "sec_filing_info.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "ticker": _normalize_ticker(ticker),
+                    "q": q,
+                    "fy": fy,
+                    "sec_filing_datetime": sec_filing_dt,
+                },
+                f,
+                indent=2,
+            )
 
         for ex_code, filename in exhibits.items():
             if not filename:
