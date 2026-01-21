@@ -373,9 +373,11 @@ def fetch_latest_earnings_8k(
             report_doc = prior_report["primary_document"]
             report_ext = os.path.splitext(report_doc)[1] or ".htm"
             report_label = prior_report["form"].replace("-", "").lower()
+            report_prefix = file_prefix
             if q is not None and fy is not None:
-                _, _, report_label = _prior_quarter_label(q, fy)
-            report_path = os.path.join(out_base, f"{file_prefix}{report_label}{report_ext}")
+                prev_q, prev_fy, report_label = _prior_quarter_label(q, fy)
+                report_prefix = _file_prefix(ticker, prev_q, prev_fy)
+            report_path = os.path.join(out_base, f"{report_prefix}{report_label}{report_ext}")
             report_url = f"{report_base_url}/{report_doc}"
             _download_file(report_url, report_path, user_agent, ssl_context)
             saved.append(report_path)
