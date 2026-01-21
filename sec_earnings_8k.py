@@ -333,6 +333,7 @@ def fetch_latest_earnings_8k(
 
         saved = []
         ex99_1_paths: list[str] = []
+        html_paths: list[str] = []
         base_url = f"{SEC_ARCHIVES_BASE}/{int(cik)}/{accession_nodash}"
         out_base = os.path.join(outdir, _folder_name(ticker, q, fy))
         file_prefix = _file_prefix(ticker, q, fy)
@@ -349,6 +350,7 @@ def fetch_latest_earnings_8k(
             if ex_code == "EX-99.1":
                 ex99_1_paths.append(dest_path)
             if os.path.splitext(dest_path)[1].lower() in {".htm", ".html"}:
+                html_paths.append(dest_path)
                 _download_linked_images(
                     dest_path,
                     base_url=base_url,
@@ -380,6 +382,7 @@ def fetch_latest_earnings_8k(
             _download_file(report_url, report_path, user_agent, ssl_context)
             saved.append(report_path)
             if os.path.splitext(report_path)[1].lower() in {".htm", ".html"}:
+                html_paths.append(report_path)
                 _download_linked_images(
                     report_path,
                     base_url=report_base_url,
@@ -394,6 +397,26 @@ def fetch_latest_earnings_8k(
                         saved.append(pdf_path)
                     except Exception as exc:
                         print(f"PDF conversion failed for {report_path}: {exc}")
+
+        if save_pdf and html_paths:
+            retained_html = []
+            for html_path in html_paths:
+                pdf_path = os.path.splitext(html_path)[0] + ".pdf"
+                if not os.path.exists(pdf_path):
+                    retained_html.append(html_path)
+                    continue
+                try:
+                    os.remove(html_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    retained_html.append(html_path)
+                if html_path in saved:
+                    saved.remove(html_path)
+            if not retained_html:
+                images_dir = os.path.join(out_base, "img")
+                if os.path.isdir(images_dir):
+                    shutil.rmtree(images_dir, ignore_errors=True)
 
         # Quarter date extraction removed; keep downloads only.
 

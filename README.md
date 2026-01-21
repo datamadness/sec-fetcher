@@ -49,7 +49,7 @@ python3 sec_earnings_8k.py --ticker COST
 - `--user-agent` (optional): SEC requires a User-Agent with contact info.
 - `--ca-bundle` (optional): Path to a CA bundle (PEM) if your system certs are missing.
 - `--insecure` (optional): Disable TLS verification (not recommended).
-- `--pdf` (optional): Also save HTML exhibits as PDF (requires `wkhtmltopdf`).
+- `--pdf` (optional): Also save HTML exhibits as PDF (requires `wkhtmltopdf`). When PDF conversion succeeds, HTML files and the `img/` folder are removed.
 
 ## Examples
 
