@@ -85,7 +85,11 @@ def _matches_exhibit(name: str, ex_code: str) -> bool:
     return any(p in name_norm for p in patterns)
 
 
-def _find_exhibit_files(index_json: dict) -> dict:
+def _is_html_doc(name: str) -> bool:
+    return os.path.splitext(name)[1].lower() in {".htm", ".html"}
+
+
+def _find_exhibit_files(index_json: dict, primary_document: Optional[str] = None) -> dict:
     found = {"EX-99.1": None, "EX-99.2": None}
     items = index_json.get("directory", {}).get("item", [])
     for item in items:
@@ -104,6 +108,38 @@ def _find_exhibit_files(index_json: dict) -> dict:
                 ex_code = f"EX-99.{match.group(1)}"
                 if not found[ex_code]:
                     found[ex_code] = name
+
+    # Fallback: some filings omit explicit EX-99 labels. Heuristically pick HTML docs besides the primary.
+    if not found["EX-99.1"] or not found["EX-99.2"]:
+        candidates = []
+        for item in items:
+            name = item.get("name", "") or ""
+            if not _is_html_doc(name):
+                continue
+            name_lower = name.lower()
+            if primary_document and name_lower == primary_document.lower():
+                continue
+            if any(token in name_lower for token in ["xsd", "xml", "xbrl", "json", "js", "css", "schema", "cal", "lab", "pre", "def", "summary"]):
+                continue
+            candidates.append(name)
+        if candidates:
+            # Score candidates to prefer earnings press releases/presentations.
+            def score(n: str) -> int:
+                s = 0
+                nl = n.lower()
+                if "earnings" in nl or "release" in nl or "press" in nl:
+                    s += 3
+                if "presentation" in nl or "slides" in nl or "deck" in nl:
+                    s += 2
+                if "99" in re.sub(r"[^0-9]", "", nl):
+                    s += 2
+                return s
+
+            candidates.sort(key=lambda n: (score(n), n), reverse=True)
+            if not found["EX-99.1"]:
+                found["EX-99.1"] = candidates[0]
+            if not found["EX-99.2"] and len(candidates) > 1:
+                found["EX-99.2"] = candidates[1]
     return found
 
 
@@ -339,7 +375,7 @@ def fetch_latest_earnings_8k(
         except urllib.error.HTTPError:
             continue
 
-        exhibits = _find_exhibit_files(index_json)
+        exhibits = _find_exhibit_files(index_json, primary_document=candidate.get("primary_document"))
         if not exhibits["EX-99.1"] and not exhibits["EX-99.2"]:
             continue
 
