@@ -89,25 +89,44 @@ def _is_html_doc(name: str) -> bool:
     return os.path.splitext(name)[1].lower() in {".htm", ".html"}
 
 
+def _exhibit_score(name: str) -> int:
+    ext = os.path.splitext(name)[1].lower()
+    if ext in {".htm", ".html"}:
+        return 4
+    if ext == ".pdf":
+        return 3
+    if ext == ".txt":
+        return 2
+    if ext in {".jpg", ".jpeg", ".png", ".gif", ".bmp"}:
+        return 1
+    return 0
+
+
 def _find_exhibit_files(index_json: dict, primary_document: Optional[str] = None) -> dict:
     found = {"EX-99.1": None, "EX-99.2": None}
+    scores = {"EX-99.1": -1, "EX-99.2": -1}
     items = index_json.get("directory", {}).get("item", [])
     for item in items:
         file_type = (item.get("type") or "").upper()
         name = item.get("name", "")
         if not name:
             continue
-        if file_type == "EX-99.1" or _matches_exhibit(name, "EX-99.1"):
-            found["EX-99.1"] = name
-        if file_type == "EX-99.2" or _matches_exhibit(name, "EX-99.2"):
-            found["EX-99.2"] = name
+        for ex_code in ("EX-99.1", "EX-99.2"):
+            if file_type == ex_code or _matches_exhibit(name, ex_code):
+                sc = _exhibit_score(name)
+                if sc > scores[ex_code]:
+                    found[ex_code] = name
+                    scores[ex_code] = sc
         if not found["EX-99.1"] or not found["EX-99.2"]:
             normalized = re.sub(r"[^a-z0-9]", "", name.lower())
             match = re.search(r"ex99([12])", normalized)
             if match:
                 ex_code = f"EX-99.{match.group(1)}"
                 if not found[ex_code]:
-                    found[ex_code] = name
+                    sc = _exhibit_score(name)
+                    if sc > scores[ex_code]:
+                        found[ex_code] = name
+                        scores[ex_code] = sc
 
     # Fallback: some filings omit explicit EX-99 labels. Heuristically pick HTML docs besides the primary.
     if not found["EX-99.1"] or not found["EX-99.2"]:
