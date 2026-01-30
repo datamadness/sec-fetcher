@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import html as html_lib
 import json
 import os
 import re
@@ -30,17 +31,29 @@ from typing import Iterable, Optional
 SEC_TICKER_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
+DUCKDUCKGO_HTML_SEARCH = "https://duckduckgo.com/html/?q={query}"
+SEARCH_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 DEFAULT_OUTDIR = "./sec_earnings_8k"
+DEFAULT_TRANSCRIPT_COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".investing_cookie.txt")
+DEFAULT_TRANSCRIPT_STEM = "earnings_call_transcript"
 
 
-def _http_get(url: str, user_agent: str, ssl_context: Optional[ssl.SSLContext]) -> bytes:
+def _http_get(
+    url: str,
+    user_agent: str,
+    ssl_context: Optional[ssl.SSLContext],
+    extra_headers: Optional[dict[str, str]] = None,
+) -> bytes:
+    headers = {
+        "User-Agent": user_agent,
+        "Accept-Encoding": "gzip, deflate",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(
         url,
-        headers={
-            "User-Agent": user_agent,
-            "Accept-Encoding": "gzip, deflate",
-        },
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
         data = resp.read()
@@ -318,14 +331,25 @@ def _download_linked_images(
 
 
 
-def _convert_html_to_pdf(html_path: str, pdf_path: str) -> None:
+def _convert_html_to_pdf(
+    html_path: str,
+    pdf_path: str,
+    extra_args: Optional[list[str]] = None,
+    allow_failure_if_output: bool = False,
+) -> None:
     wkhtmltopdf = shutil.which("wkhtmltopdf")
     if not wkhtmltopdf:
         raise RuntimeError("wkhtmltopdf not found in PATH")
-    subprocess.run(
-        [wkhtmltopdf, "--quiet", "--enable-local-file-access", html_path, pdf_path],
-        check=True,
-    )
+    cmd = [wkhtmltopdf, "--quiet", "--enable-local-file-access"]
+    if extra_args:
+        cmd.extend(extra_args)
+    cmd.extend([html_path, pdf_path])
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        if allow_failure_if_output and os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+            print(f"wkhtmltopdf exited with code {result.returncode}; keeping generated PDF.")
+            return
+        raise RuntimeError(f"wkhtmltopdf failed with exit code {result.returncode}")
 
 
 def _validate_quarter_inputs(q: Optional[int], fy: Optional[int]) -> Optional[tuple[int, int]]:
@@ -364,6 +388,237 @@ def _prior_quarter_label(q: int, fy: int) -> tuple[int, int, str]:
     return prev_q, prev_fy, label
 
 
+def _trim_pdf_pages(pdf_path: str, trim_first: int, trim_last: int) -> bool:
+    if trim_first < 0 or trim_last < 0:
+        return False
+    try:
+        from pypdf import PdfReader, PdfWriter  # type: ignore
+    except Exception:
+        try:
+            from PyPDF2 import PdfReader, PdfWriter  # type: ignore
+        except Exception:
+            print("PDF trim skipped: install 'pypdf' to remove the first/last pages.")
+            return False
+
+    reader = PdfReader(pdf_path)
+    total = len(reader.pages)
+    if total <= (trim_first + trim_last):
+        print(f"PDF trim skipped: transcript has {total} pages.")
+        return False
+    start_idx = trim_first
+    end_idx = total - trim_last
+    writer = PdfWriter()
+    for i in range(start_idx, end_idx):
+        writer.add_page(reader.pages[i])
+    tmp_path = pdf_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        writer.write(f)
+    os.replace(tmp_path, pdf_path)
+    return True
+
+
+def _build_transcript_query(ticker: str, q: Optional[int], fy: Optional[int]) -> str:
+    parts = [ticker, "earnings call transcript"]
+    if q is not None and fy is not None:
+        parts.append(f"Q{q} FY{fy}")
+    parts.append("investing.com")
+    return " ".join(parts)
+
+
+class _DDGResultParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.urls: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag.lower() != "a":
+            return
+        href = None
+        class_attr = ""
+        for key, value in attrs:
+            if key.lower() == "href":
+                href = value
+            elif key.lower() == "class" and value:
+                class_attr = value
+        if href and "result__a" in class_attr:
+            self.urls.append(href)
+
+
+def _extract_ddg_result_urls(html: str) -> list[str]:
+    parser = _DDGResultParser()
+    parser.feed(html)
+    return parser.urls
+
+
+def _normalize_ddg_url(url: str) -> str:
+    url = html_lib.unescape(url)
+    if url.startswith("/l/?") or "duckduckgo.com/l/?" in url:
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "uddg" in qs and qs["uddg"]:
+            return qs["uddg"][0]
+    return url
+
+
+def _search_investing_transcript_url(
+    ticker: str,
+    q: Optional[int],
+    fy: Optional[int],
+    user_agent: str,
+    ssl_context: Optional[ssl.SSLContext],
+) -> Optional[str]:
+    query = _build_transcript_query(ticker, q, fy)
+    url = DUCKDUCKGO_HTML_SEARCH.format(query=urllib.parse.quote_plus(query))
+    html = _http_get(url, SEARCH_USER_AGENT, ssl_context).decode("utf-8", errors="replace")
+    for href in _extract_ddg_result_urls(html):
+        normalized = _normalize_ddg_url(href)
+        parsed = urllib.parse.urlparse(normalized)
+        if not parsed.netloc or "investing.com" not in parsed.netloc:
+            continue
+        if "/news/transcripts/" not in parsed.path:
+            continue
+        return normalized
+    return None
+
+
+def _read_cookie_file(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cookie = f.read().strip()
+    except FileNotFoundError:
+        return None
+    if not cookie:
+        return None
+    return cookie
+
+
+def _write_cookie_file(path: str, cookie: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cookie.strip())
+
+
+def _prompt_for_cookie() -> Optional[str]:
+    help_text = (
+        "To get the Investing.com cookie from your browser:\n"
+        "  1) Open the transcript page in your browser.\n"
+        "  2) Open DevTools (F12) and go to the Network tab.\n"
+        "  3) Refresh the page, click the main document request.\n"
+        "  4) In Request Headers, copy the full 'Cookie' value.\n"
+        "You can pass it once via --transcript-cookie or paste it here.\n"
+    )
+    if not sys.stdin.isatty():
+        print(help_text)
+        print("Non-interactive session: pass --transcript-cookie or use --transcript-cookie-file.")
+        return None
+    print(help_text)
+    try:
+        cookie = input("Enter Investing.com cookie (leave blank to skip): ").strip()
+    except EOFError:
+        return None
+    return cookie or None
+
+
+def _looks_like_auth_wall(html: str) -> bool:
+    lower = html.lower()
+    if "transcript" in lower:
+        return False
+    if "sign in" in lower or "log in" in lower or "subscribe" in lower:
+        return True
+    return False
+
+
+def _download_investing_transcript(
+    ticker: str,
+    q: Optional[int],
+    fy: Optional[int],
+    out_base: str,
+    user_agent: str,
+    ssl_context: Optional[ssl.SSLContext],
+    transcript_url: Optional[str],
+    cookie_file: str,
+    cookie_value: Optional[str],
+) -> bool:
+    url = transcript_url
+    if not url:
+        url = _search_investing_transcript_url(ticker, q, fy, user_agent, ssl_context)
+        if not url:
+            print("Transcript search did not find an Investing.com result.")
+            return False
+
+    cookie = cookie_value
+    if cookie:
+        _write_cookie_file(cookie_file, cookie)
+    if not cookie:
+        cookie = _read_cookie_file(cookie_file)
+    if not cookie:
+        cookie = _prompt_for_cookie()
+        if cookie:
+            _write_cookie_file(cookie_file, cookie)
+    if not cookie:
+        print("Transcript download skipped (no cookie provided).")
+        return False
+
+    last_error: Optional[str] = None
+    for attempt in range(2):
+        try:
+            html_bytes = _http_get(
+                url,
+                user_agent,
+                ssl_context,
+                extra_headers={
+                    "Cookie": cookie,
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code in {401, 403}:
+                last_error = f"HTTP {exc.code}"
+            else:
+                print(f"Transcript download failed: HTTP {exc.code}")
+                return False
+        else:
+            html_text = html_bytes.decode("utf-8", errors="replace")
+            if not _looks_like_auth_wall(html_text):
+                file_prefix = _file_prefix(ticker, q, fy)
+                html_path = os.path.join(out_base, f"{file_prefix}{DEFAULT_TRANSCRIPT_STEM}.html")
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(html_text)
+                pdf_path = os.path.splitext(html_path)[0] + ".pdf"
+                try:
+                    _convert_html_to_pdf(
+                        html_path,
+                        pdf_path,
+                        extra_args=[
+                            "--load-error-handling",
+                            "ignore",
+                            "--load-media-error-handling",
+                            "ignore",
+                        ],
+                        allow_failure_if_output=True,
+                    )
+                    try:
+                        _trim_pdf_pages(pdf_path, trim_first=1, trim_last=2)
+                    except Exception as exc:
+                        print(f"Transcript PDF trim failed: {exc}")
+                    print(f"Transcript saved: {pdf_path}")
+                except Exception as exc:
+                    print(f"Transcript PDF conversion failed: {exc}")
+                return True
+            last_error = "auth wall detected"
+
+        if attempt == 0:
+            print(f"Transcript access failed ({last_error}). Please refresh cookie.")
+            cookie = _prompt_for_cookie()
+            if cookie:
+                _write_cookie_file(cookie_file, cookie)
+                continue
+        break
+
+    print("Transcript download failed; cookie may need refresh.")
+    return False
+
+
 def fetch_latest_earnings_8k(
     ticker: str,
     date_filter: Optional[str],
@@ -373,6 +628,10 @@ def fetch_latest_earnings_8k(
     save_pdf: bool,
     q: Optional[int] = None,
     fy: Optional[int] = None,
+    transcript: bool = False,
+    transcript_cookie_file: Optional[str] = None,
+    transcript_cookie: Optional[str] = None,
+    transcript_url: Optional[str] = None,
 ) -> int:
     cik = _ticker_to_cik(ticker, user_agent, ssl_context)
     submissions_url = SEC_SUBMISSIONS_URL.format(cik=cik)
@@ -439,13 +698,13 @@ def fetch_latest_earnings_8k(
                     user_agent=user_agent,
                     ssl_context=ssl_context,
                 )
-            if save_pdf and os.path.splitext(dest_path)[1].lower() in {".htm", ".html"}:
-                pdf_path = os.path.splitext(dest_path)[0] + ".pdf"
-                try:
-                    _convert_html_to_pdf(dest_path, pdf_path)
-                    saved.append(pdf_path)
-                except Exception as exc:
-                    print(f"PDF conversion failed for {dest_path}: {exc}")
+                if save_pdf and os.path.splitext(dest_path)[1].lower() in {".htm", ".html"}:
+                    pdf_path = os.path.splitext(dest_path)[0] + ".pdf"
+                    try:
+                        _convert_html_to_pdf(dest_path, pdf_path)
+                        saved.append(pdf_path)
+                    except Exception as exc:
+                        print(f"PDF conversion failed for {dest_path}: {exc}")
             time.sleep(0.2)
 
         prior_report = _find_prior_report(submissions, candidate["filing_date"])
@@ -510,6 +769,22 @@ def fetch_latest_earnings_8k(
             missing = [k for k, v in exhibits.items() if v is None]
             if missing:
                 print("Missing exhibits:", ", ".join(missing))
+            if transcript:
+                cookie_file = transcript_cookie_file or DEFAULT_TRANSCRIPT_COOKIE_FILE
+                try:
+                    _download_investing_transcript(
+                        ticker=ticker,
+                        q=q,
+                        fy=fy,
+                        out_base=out_base,
+                        user_agent=user_agent,
+                        ssl_context=ssl_context,
+                        transcript_url=transcript_url,
+                        cookie_file=cookie_file,
+                        cookie_value=transcript_cookie,
+                    )
+                except Exception as exc:
+                    print(f"Transcript download error: {exc}")
             return 0
 
     print("8-K not available for the requested date or earnings criteria.")
@@ -563,6 +838,26 @@ def main() -> int:
         action="store_true",
         help="Also save HTML exhibits as PDF (requires wkhtmltopdf in PATH).",
     )
+    parser.add_argument(
+        "--transcript",
+        action="store_true",
+        help="Also download the Investing.com earnings call transcript as PDF.",
+    )
+    parser.add_argument(
+        "--transcript-cookie",
+        default=None,
+        help="Investing.com cookie string (optional; saved for future use).",
+    )
+    parser.add_argument(
+        "--transcript-cookie-file",
+        default=None,
+        help=f"Path to store Investing.com cookie (default: {DEFAULT_TRANSCRIPT_COOKIE_FILE}).",
+    )
+    parser.add_argument(
+        "--transcript-url",
+        default=None,
+        help="Optional direct transcript URL to skip search.",
+    )
     args = parser.parse_args()
 
     date_filter = _date_or_none(args.date)
@@ -586,6 +881,10 @@ def main() -> int:
             save_pdf=args.pdf,
             q=q,
             fy=fy,
+            transcript=args.transcript,
+            transcript_cookie_file=args.transcript_cookie_file,
+            transcript_cookie=args.transcript_cookie,
+            transcript_url=args.transcript_url,
         )
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(exc):

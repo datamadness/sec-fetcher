@@ -12,6 +12,7 @@ offline. PDF conversion is optional.
 - Optionally filter by a specific filing date (`YYYY-MM-DD`).
 - Save EX-99.1 / EX-99.2 exhibits, plus linked image assets.
 - Optionally convert HTML exhibits to PDF.
+- Optionally auto-search Investing.com and save the earnings call transcript as PDF.
 
 ## Install dependencies
 
@@ -19,6 +20,14 @@ This tool uses the Python standard library by default.
 
 Optional PDF conversion requires `wkhtmltopdf`:
 - Install `wkhtmltopdf` and ensure it is available in your `PATH`.
+
+Transcript PDF trimming (remove first page + last 2 pages) requires `pypdf`:
+- `pip install pypdf`
+
+You can also install optional Python deps via:
+```bash
+pip install -r requirements.txt
+```
 
 Examples:
 ```bash
@@ -30,7 +39,7 @@ wkhtmltopdf --version
 
 1. Install Python 3 (from https://www.python.org/downloads/windows/) and ensure `python` is on your PATH.
 2. (Optional) Install `wkhtmltopdf` if you want PDF output. Add it to PATH so `wkhtmltopdf --version` works in PowerShell.
-3. No Python packages are required; `requirements.txt` is empty.
+3. (Optional) Install `pypdf` if you want transcript page trimming.
 4. On Windows, use `python` instead of `python3` in the CLI examples below.
 
 ## Usage
@@ -50,6 +59,11 @@ python3 sec_earnings_8k.py --ticker COST
 - `--ca-bundle` (optional): Path to a CA bundle (PEM) if your system certs are missing.
 - `--insecure` (optional): Disable TLS verification (not recommended).
 - `--pdf` (optional): Also save HTML exhibits as PDF (requires `wkhtmltopdf`). When PDF conversion succeeds, HTML files and the `img/` folder are removed.
+- `--transcript` (optional): Also download the Investing.com earnings call transcript as PDF.
+- Transcript PDFs are trimmed to remove the first page and the last 2 pages (requires `pypdf`).
+- `--transcript-cookie` (optional): Investing.com cookie string. Saved to the cookie file for reuse.
+- `--transcript-cookie-file` (optional): Path to store the Investing.com cookie (default: `./.investing_cookie.txt` next to the script).
+- `--transcript-url` (optional): Direct transcript URL to skip search.
 
 ## Examples
 
@@ -76,6 +90,53 @@ python3 sec_earnings_8k.py --ticker COST --outdir ./downloads
 Download and also create PDFs:
 ```bash
 python3 sec_earnings_8k.py --ticker COST --pdf
+```
+
+Download SEC files and transcript (auto-search Investing.com):
+```bash
+python3 sec_earnings_8k.py --ticker COST --q 1 --fy 2026 --transcript
+```
+
+Provide/update cookie manually (saved for future runs):
+```bash
+python3 sec_earnings_8k.py --ticker COST --q 1 --fy 2026 --transcript --transcript-cookie "YOUR_COOKIE_STRING"
+```
+
+## Earnings call transcript guide
+
+When `--transcript` is used, the tool:
+- Searches DuckDuckGo for: `<TICKER> earnings call transcript Q<q> FY<fy> investing.com`.
+- Opens the first Investing.com transcript result.
+- Saves the transcript HTML and PDF into the same output folder as the SEC filings.
+- Trims the PDF to remove the first page and last 2 pages (requires `pypdf`).
+  - If `wkhtmltopdf` reports external resource load errors but still creates the PDF, the file is kept.
+
+### Getting the Investing.com cookie
+
+You need to be logged in on Investing.com. The tool will reuse a saved cookie, but if it is missing
+or expired it will prompt you. To obtain the cookie value from your browser:
+
+1. Open the transcript page in your browser (Brave/Chrome/Edge).
+2. Open DevTools (F12) and go to the **Network** tab.
+3. Click the **Doc** filter (to show the main document requests).
+4. Refresh the page and click the top transcript document entry.
+5. In the right pane, open **Headers** → **Request Headers**.
+6. Copy the full value of **Cookie:** (everything after `Cookie:`).
+
+Paste the cookie at the prompt or pass it once via `--transcript-cookie`.
+It will be saved to `./.investing_cookie.txt` (or your custom `--transcript-cookie-file` path).
+
+### Transcript output naming
+
+Transcript files include the substring `earnings_call_transcript`:
+```
+<ticker>_q<q>_<fy>_earnings_call_transcript.html
+<ticker>_q<q>_<fy>_earnings_call_transcript.pdf
+```
+
+Example:
+```
+aapl_q1_2026_earnings_call_transcript.pdf
 ```
 
 Work around TLS issues (not recommended):
@@ -154,6 +215,7 @@ Inside the folder:
 - `cost_q4_2025_8k_991.htm` / `cost_q4_2025_8k_991.pdf`
 - `cost_q4_2025_8k_992.htm` / `cost_q4_2025_8k_992.pdf`
 - `cost_q3_2025_10q.htm` / `cost_q3_2025_10q.pdf`
+- `cost_q4_2025_earnings_call_transcript.html` / `cost_q4_2025_earnings_call_transcript.pdf`
 - `img/` (linked images referenced by the HTML)
 
 If `--q`/`--fy` are omitted, the filenames drop the quarter/year prefix:
