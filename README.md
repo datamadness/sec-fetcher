@@ -108,7 +108,9 @@ python3 sec_earnings_8k.py --ticker COST --q 1 --fy 2026 --transcript --transcri
 When `--transcript` is used, the tool:
 - Searches DuckDuckGo for: `<TICKER> earnings call transcript Q<q> FY<fy> investing.com`.
 - Opens the first Investing.com transcript result.
-- Saves the transcript HTML and PDF into the same output folder as the SEC filings.
+- Saves the transcript into the same output folder as the SEC filings.
+- If `--pdf` is set, it creates a PDF and removes the HTML (same behavior as SEC filings).
+- If `--pdf` is not set, it keeps the HTML only.
 - Trims the PDF to remove the first page and last 2 pages (requires `pypdf`).
   - If `wkhtmltopdf` reports external resource load errors but still creates the PDF, the file is kept.
 

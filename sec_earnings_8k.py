@@ -572,6 +572,7 @@ def _download_investing_transcript(
     transcript_url: Optional[str],
     cookie_file: str,
     cookie_value: Optional[str],
+    save_pdf: bool,
 ) -> bool:
     url = transcript_url
     if not url:
@@ -618,26 +619,36 @@ def _download_investing_transcript(
                 html_path = os.path.join(out_base, f"{file_prefix}{DEFAULT_TRANSCRIPT_STEM}.html")
                 with open(html_path, "w", encoding="utf-8") as f:
                     f.write(html_text)
-                pdf_path = os.path.splitext(html_path)[0] + ".pdf"
-                try:
-                    _convert_html_to_pdf(
-                        html_path,
-                        pdf_path,
-                        extra_args=[
-                            "--load-error-handling",
-                            "ignore",
-                            "--load-media-error-handling",
-                            "ignore",
-                        ],
-                        allow_failure_if_output=True,
-                    )
+                if save_pdf:
+                    pdf_path = os.path.splitext(html_path)[0] + ".pdf"
                     try:
-                        _trim_pdf_pages(pdf_path, trim_first=1, trim_last=2)
+                        _convert_html_to_pdf(
+                            html_path,
+                            pdf_path,
+                            extra_args=[
+                                "--load-error-handling",
+                                "ignore",
+                                "--load-media-error-handling",
+                                "ignore",
+                            ],
+                            allow_failure_if_output=True,
+                        )
+                        try:
+                            _trim_pdf_pages(pdf_path, trim_first=1, trim_last=2)
+                        except Exception as exc:
+                            print(f"Transcript PDF trim failed: {exc}")
+                        print(f"Transcript saved: {pdf_path}")
+                        try:
+                            os.remove(html_path)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            print(f"Could not remove transcript HTML: {html_path}")
                     except Exception as exc:
-                        print(f"Transcript PDF trim failed: {exc}")
-                    print(f"Transcript saved: {pdf_path}")
-                except Exception as exc:
-                    print(f"Transcript PDF conversion failed: {exc}")
+                        print(f"Transcript PDF conversion failed: {exc}")
+                        print(f"Transcript HTML retained: {html_path}")
+                else:
+                    print(f"Transcript saved: {html_path}")
                 return True
             last_error = "auth wall detected"
 
@@ -819,6 +830,7 @@ def fetch_latest_earnings_8k(
                         transcript_url=transcript_url,
                         cookie_file=cookie_file,
                         cookie_value=transcript_cookie,
+                        save_pdf=save_pdf,
                     )
                 except Exception as exc:
                     print(f"Transcript download error: {exc}")
