@@ -98,6 +98,18 @@ def _matches_exhibit(name: str, ex_code: str) -> bool:
     return any(p in name_norm for p in patterns)
 
 
+def _infer_exhibit_code_from_name(name: str) -> Optional[str]:
+    base = os.path.splitext(name)[0].lower()
+    match = re.search(r"(?:ex|exhibit)[-_]?99[\\._-]?([12])", base)
+    if match:
+        return f"EX-99.{match.group(1)}"
+    digits_only = re.sub(r"[^0-9]", "", base)
+    match = re.search(r"(99[12])$", digits_only)
+    if match:
+        return f"EX-99.{match.group(1)[-1]}"
+    return None
+
+
 def _is_html_doc(name: str) -> bool:
     return os.path.splitext(name)[1].lower() in {".htm", ".html"}
 
@@ -130,6 +142,12 @@ def _find_exhibit_files(index_json: dict, primary_document: Optional[str] = None
                 if sc > scores[ex_code]:
                     found[ex_code] = name
                     scores[ex_code] = sc
+        inferred = _infer_exhibit_code_from_name(name)
+        if inferred in {"EX-99.1", "EX-99.2"}:
+            sc = _exhibit_score(name)
+            if sc > scores[inferred]:
+                found[inferred] = name
+                scores[inferred] = sc
         if not found["EX-99.1"] or not found["EX-99.2"]:
             normalized = re.sub(r"[^a-z0-9]", "", name.lower())
             match = re.search(r"ex99([12])", normalized)
@@ -173,6 +191,22 @@ def _find_exhibit_files(index_json: dict, primary_document: Optional[str] = None
             if not found["EX-99.2"] and len(candidates) > 1:
                 found["EX-99.2"] = candidates[1]
     return found
+
+
+def _debug_print_exhibit_mapping(index_json: dict, exhibits: dict) -> None:
+    print("Debug: exhibit mapping")
+    print(f"  EX-99.1 -> {exhibits.get('EX-99.1')}")
+    print(f"  EX-99.2 -> {exhibits.get('EX-99.2')}")
+    items = index_json.get("directory", {}).get("item", [])
+    print("Debug: index items with possible exhibit hints:")
+    for item in items:
+        name = item.get("name", "")
+        file_type = (item.get("type") or "").upper()
+        if not name:
+            continue
+        inferred = _infer_exhibit_code_from_name(name)
+        if file_type.startswith("EX-99") or inferred or "99" in name.lower():
+            print(f"  type={file_type or '-'} name={name} inferred={inferred or '-'}")
 
 
 def _filing_candidates(submissions: dict, date_filter: Optional[str]) -> Iterable[dict]:
@@ -632,6 +666,7 @@ def fetch_latest_earnings_8k(
     transcript_cookie_file: Optional[str] = None,
     transcript_cookie: Optional[str] = None,
     transcript_url: Optional[str] = None,
+    debug: bool = False,
 ) -> int:
     cik = _ticker_to_cik(ticker, user_agent, ssl_context)
     submissions_url = SEC_SUBMISSIONS_URL.format(cik=cik)
@@ -654,6 +689,8 @@ def fetch_latest_earnings_8k(
             continue
 
         exhibits = _find_exhibit_files(index_json, primary_document=candidate.get("primary_document"))
+        if debug:
+            _debug_print_exhibit_mapping(index_json, exhibits)
         if not exhibits["EX-99.1"] and not exhibits["EX-99.2"]:
             continue
 
@@ -839,6 +876,11 @@ def main() -> int:
         help="Also save HTML exhibits as PDF (requires wkhtmltopdf in PATH).",
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print debug info about exhibit selection and index items.",
+    )
+    parser.add_argument(
         "--transcript",
         action="store_true",
         help="Also download the Investing.com earnings call transcript as PDF.",
@@ -885,6 +927,7 @@ def main() -> int:
             transcript_cookie_file=args.transcript_cookie_file,
             transcript_cookie=args.transcript_cookie,
             transcript_url=args.transcript_url,
+            debug=args.debug,
         )
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(exc):

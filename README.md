@@ -59,6 +59,7 @@ python3 sec_earnings_8k.py --ticker COST
 - `--ca-bundle` (optional): Path to a CA bundle (PEM) if your system certs are missing.
 - `--insecure` (optional): Disable TLS verification (not recommended).
 - `--pdf` (optional): Also save HTML exhibits as PDF (requires `wkhtmltopdf`). When PDF conversion succeeds, HTML files and the `img/` folder are removed.
+- `--debug` (optional): Print exhibit selection details and index items.
 - `--transcript` (optional): Also download the Investing.com earnings call transcript as PDF.
 - Transcript PDFs are trimmed to remove the first page and the last 2 pages (requires `pypdf`).
 - `--transcript-cookie` (optional): Investing.com cookie string. Saved to the cookie file for reuse.
