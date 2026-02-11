@@ -32,11 +32,16 @@ SEC_TICKER_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
 DUCKDUCKGO_HTML_SEARCH = "https://duckduckgo.com/html/?q={query}"
+BING_HTML_SEARCH = "https://www.bing.com/search?q={query}&setlang=en-us"
 SEARCH_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 DEFAULT_OUTDIR = "./sec_earnings_8k"
 DEFAULT_TRANSCRIPT_COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".investing_cookie.txt")
 DEFAULT_TRANSCRIPT_STEM = "earnings_call_transcript"
+
+
+class TranscriptSearchError(RuntimeError):
+    pass
 
 
 def _http_get(
@@ -484,6 +489,15 @@ def _extract_ddg_result_urls(html: str) -> list[str]:
     return parser.urls
 
 
+def _extract_bing_result_urls(html: str) -> list[str]:
+    urls: list[str] = []
+    for block in re.findall(r'<li[^>]+class="[^"]*b_algo[^"]*"[^>]*>.*?</li>', html, re.I | re.S):
+        match = re.search(r'<h2>\s*<a[^>]+href="([^"]+)"', block, re.I | re.S)
+        if match:
+            urls.append(match.group(1))
+    return urls
+
+
 def _normalize_ddg_url(url: str) -> str:
     url = html_lib.unescape(url)
     if url.startswith("/l/?") or "duckduckgo.com/l/?" in url:
@@ -494,25 +508,188 @@ def _normalize_ddg_url(url: str) -> str:
     return url
 
 
+def _normalize_bing_url(url: str) -> str:
+    return html_lib.unescape(url)
+
+
+def _is_investing_transcript_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.netloc or "investing.com" not in parsed.netloc:
+        return False
+    return "/news/transcripts/" in parsed.path
+
+
+def _looks_like_ddg_block_page(html: str) -> bool:
+    lower = html.lower()
+    markers = [
+        "bots use duckduckgo too",
+        "anomaly-modal",
+        "please complete the following challenge",
+        "anomaly.js",
+    ]
+    return any(marker in lower for marker in markers)
+
+
+def _looks_like_bing_block_page(html: str) -> bool:
+    lower = html.lower()
+    markers = [
+        "our systems have detected unusual traffic",
+        "verify you are a human",
+        "captcha",
+        "bing.com/challenge",
+    ]
+    return any(marker in lower for marker in markers)
+
+
+def _run_search_attempt(
+    *,
+    engine: str,
+    search_url: str,
+    query: str,
+    ssl_context: Optional[ssl.SSLContext],
+    result_extractor,
+    url_normalizer,
+    block_detector,
+    no_results_markers: list[str],
+) -> dict:
+    attempt: dict[str, object] = {
+        "engine": engine,
+        "query": query,
+        "search_url": search_url,
+        "status": "network_error",
+        "detail": "",
+        "transcript_url": None,
+        "raw_result_count": 0,
+    }
+    try:
+        html = _http_get(search_url, SEARCH_USER_AGENT, ssl_context).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        attempt["status"] = "network_error"
+        attempt["detail"] = f"HTTP {exc.code}"
+        return attempt
+    except urllib.error.URLError as exc:
+        attempt["status"] = "network_error"
+        attempt["detail"] = str(exc.reason)
+        return attempt
+    except Exception as exc:
+        attempt["status"] = "network_error"
+        attempt["detail"] = str(exc)
+        return attempt
+
+    if block_detector(html):
+        attempt["status"] = "bot_blocked"
+        attempt["detail"] = "Challenge/anti-bot page detected."
+        return attempt
+
+    raw_urls = result_extractor(html)
+    attempt["raw_result_count"] = len(raw_urls)
+    normalized_urls = [url_normalizer(u) for u in raw_urls]
+
+    for normalized in normalized_urls:
+        if _is_investing_transcript_url(normalized):
+            attempt["status"] = "found"
+            attempt["transcript_url"] = normalized
+            attempt["detail"] = "Found Investing.com transcript URL."
+            return attempt
+
+    if normalized_urls:
+        attempt["status"] = "no_relevant_result"
+        attempt["detail"] = (
+            f"Parsed {len(normalized_urls)} results but none matched an Investing.com transcript URL."
+        )
+        return attempt
+
+    lower = html.lower()
+    if any(marker in lower for marker in no_results_markers):
+        attempt["status"] = "no_relevant_result"
+        attempt["detail"] = "Search page loaded but reported no matching results."
+    else:
+        attempt["status"] = "parse_failed"
+        attempt["detail"] = "Search page did not expose parseable result links."
+    return attempt
+
+
+def _log_search_attempt(attempt: dict, debug: bool) -> None:
+    engine = str(attempt.get("engine"))
+    status = str(attempt.get("status"))
+    detail = str(attempt.get("detail") or "")
+    if status == "found":
+        print(f"Transcript search ({engine}): found candidate URL.")
+        if debug:
+            print(f"  URL: {attempt.get('transcript_url')}")
+        return
+    if status == "no_relevant_result":
+        print(f"Transcript search ({engine}): results loaded, but no Investing.com transcript URL was found.")
+    elif status == "bot_blocked":
+        print(f"Transcript search ({engine}): blocked by anti-bot challenge.")
+    elif status == "parse_failed":
+        print(f"Transcript search ({engine}): could not parse usable search results.")
+    else:
+        print(f"Transcript search ({engine}): request failed.")
+    if detail and (debug or status in {"bot_blocked", "network_error"}):
+        print(f"  Detail: {detail}")
+    if debug:
+        print(f"  Query: {attempt.get('query')}")
+        print(f"  Search URL: {attempt.get('search_url')}")
+        print(f"  Raw results parsed: {attempt.get('raw_result_count')}")
+
+
+def _format_transcript_search_failure(query: str, attempts: list[dict]) -> str:
+    lines = [
+        "Transcript search failed after trying multiple engines.",
+        f"Query: {query}",
+    ]
+    for attempt in attempts:
+        lines.append(
+            f"- {attempt.get('engine')}: {attempt.get('status')} ({attempt.get('detail')})"
+        )
+    lines.append("Try again later, pass --transcript-url, or run with --debug for more detail.")
+    return "\n".join(lines)
+
+
 def _search_investing_transcript_url(
     ticker: str,
     q: Optional[int],
     fy: Optional[int],
-    user_agent: str,
     ssl_context: Optional[ssl.SSLContext],
-) -> Optional[str]:
+    debug: bool = False,
+) -> str:
     query = _build_transcript_query(ticker, q, fy)
-    url = DUCKDUCKGO_HTML_SEARCH.format(query=urllib.parse.quote_plus(query))
-    html = _http_get(url, SEARCH_USER_AGENT, ssl_context).decode("utf-8", errors="replace")
-    for href in _extract_ddg_result_urls(html):
-        normalized = _normalize_ddg_url(href)
-        parsed = urllib.parse.urlparse(normalized)
-        if not parsed.netloc or "investing.com" not in parsed.netloc:
-            continue
-        if "/news/transcripts/" not in parsed.path:
-            continue
-        return normalized
-    return None
+    encoded_query = urllib.parse.quote_plus(query)
+    attempts: list[dict] = []
+
+    ddg_attempt = _run_search_attempt(
+        engine="DuckDuckGo",
+        search_url=DUCKDUCKGO_HTML_SEARCH.format(query=encoded_query),
+        query=query,
+        ssl_context=ssl_context,
+        result_extractor=_extract_ddg_result_urls,
+        url_normalizer=_normalize_ddg_url,
+        block_detector=_looks_like_ddg_block_page,
+        no_results_markers=["no results found", "no more results"],
+    )
+    attempts.append(ddg_attempt)
+    _log_search_attempt(ddg_attempt, debug)
+    if ddg_attempt.get("status") == "found":
+        return str(ddg_attempt["transcript_url"])
+
+    print("Transcript search: trying fallback engine (Bing).")
+    bing_attempt = _run_search_attempt(
+        engine="Bing",
+        search_url=BING_HTML_SEARCH.format(query=encoded_query),
+        query=query,
+        ssl_context=ssl_context,
+        result_extractor=_extract_bing_result_urls,
+        url_normalizer=_normalize_bing_url,
+        block_detector=_looks_like_bing_block_page,
+        no_results_markers=["there are no results for", "did not match any documents"],
+    )
+    attempts.append(bing_attempt)
+    _log_search_attempt(bing_attempt, debug)
+    if bing_attempt.get("status") == "found":
+        return str(bing_attempt["transcript_url"])
+
+    raise TranscriptSearchError(_format_transcript_search_failure(query, attempts))
 
 
 def _read_cookie_file(path: str) -> Optional[str]:
@@ -573,13 +750,17 @@ def _download_investing_transcript(
     cookie_file: str,
     cookie_value: Optional[str],
     save_pdf: bool,
+    debug: bool,
 ) -> bool:
     url = transcript_url
     if not url:
-        url = _search_investing_transcript_url(ticker, q, fy, user_agent, ssl_context)
-        if not url:
-            print("Transcript search did not find an Investing.com result.")
-            return False
+        url = _search_investing_transcript_url(
+            ticker=ticker,
+            q=q,
+            fy=fy,
+            ssl_context=ssl_context,
+            debug=debug,
+        )
 
     cookie = cookie_value
     if cookie:
@@ -831,9 +1012,14 @@ def fetch_latest_earnings_8k(
                         cookie_file=cookie_file,
                         cookie_value=transcript_cookie,
                         save_pdf=save_pdf,
+                        debug=debug,
                     )
+                except TranscriptSearchError as exc:
+                    print(str(exc))
+                    return 3
                 except Exception as exc:
                     print(f"Transcript download error: {exc}")
+                    return 3
             return 0
 
     print("8-K not available for the requested date or earnings criteria.")

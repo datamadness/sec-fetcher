@@ -59,7 +59,7 @@ python3 sec_earnings_8k.py --ticker COST
 - `--ca-bundle` (optional): Path to a CA bundle (PEM) if your system certs are missing.
 - `--insecure` (optional): Disable TLS verification (not recommended).
 - `--pdf` (optional): Also save HTML exhibits as PDF (requires `wkhtmltopdf`). When PDF conversion succeeds, HTML files and the `img/` folder are removed.
-- `--debug` (optional): Print exhibit selection details and index items.
+- `--debug` (optional): Print exhibit selection details and transcript search diagnostics.
 - `--transcript` (optional): Also download the Investing.com earnings call transcript as PDF.
 - Transcript PDFs are trimmed to remove the first page and the last 2 pages (requires `pypdf`).
 - `--transcript-cookie` (optional): Investing.com cookie string. Saved to the cookie file for reuse.
@@ -107,12 +107,21 @@ python3 sec_earnings_8k.py --ticker COST --q 1 --fy 2026 --transcript --transcri
 
 When `--transcript` is used, the tool:
 - Searches DuckDuckGo for: `<TICKER> earnings call transcript Q<q> FY<fy> investing.com`.
+- If DuckDuckGo fails or is blocked, it retries the same query on Bing.
 - Opens the first Investing.com transcript result.
 - Saves the transcript into the same output folder as the SEC filings.
 - If `--pdf` is set, it creates a PDF and removes the HTML (same behavior as SEC filings).
 - If `--pdf` is not set, it keeps the HTML only.
 - Trims the PDF to remove the first page and last 2 pages (requires `pypdf`).
   - If `wkhtmltopdf` reports external resource load errors but still creates the PDF, the file is kept.
+
+Transcript search logs now distinguish:
+- Search results were loaded but no Investing.com transcript URL matched.
+- Search engine returned an anti-bot/challenge page.
+- Search response could not be parsed into result links.
+- Search request failed (network/HTTP error).
+
+If both DuckDuckGo and Bing fail, the command exits non-zero and prints a multi-engine failure summary.
 
 ### Getting the Investing.com cookie
 
