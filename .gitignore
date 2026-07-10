@@ -4,3 +4,4 @@
 __pycache__/
 sec_earnings_8k/
 .investing_cookie*
+.secrets/

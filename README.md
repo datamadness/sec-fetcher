@@ -16,18 +16,18 @@ offline. PDF conversion is optional.
 
 ## Install dependencies
 
-This tool uses the Python standard library by default.
+SEC downloads use the Python standard library. Reliable Investing.com transcript
+retrieval uses Playwright as a browser fallback:
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
 
 Optional PDF conversion requires `wkhtmltopdf`:
 - Install `wkhtmltopdf` and ensure it is available in your `PATH`.
 
 Transcript PDF trimming (remove first page + last 2 pages) requires `pypdf`:
 - `pip install pypdf`
-
-You can also install optional Python deps via:
-```bash
-pip install -r requirements.txt
-```
 
 Examples:
 ```bash
@@ -37,10 +37,11 @@ wkhtmltopdf --version
 
 ## Windows installation
 
-1. Install Python 3 (from https://www.python.org/downloads/windows/) and ensure `python` is on your PATH.
+1. Install Python 3.10+ (from https://www.python.org/downloads/windows/) and ensure `python` is on your PATH.
 2. (Optional) Install `wkhtmltopdf` if you want PDF output. Add it to PATH so `wkhtmltopdf --version` works in PowerShell.
 3. (Optional) Install `pypdf` if you want transcript page trimming.
-4. On Windows, use `python` instead of `python3` in the CLI examples below.
+4. For transcript browser fallback, run `pip install playwright` followed by `playwright install chromium`.
+5. On Windows, use `python` instead of `python3` in the CLI examples below.
 
 ## Usage
 
@@ -52,18 +53,18 @@ python3 sec_earnings_8k.py --ticker COST
 
 - `--ticker` (required): Company ticker symbol, e.g. `COST`.
 - `--date` (optional): Filing date filter in `YYYY-MM-DD`.
-- `--q` (optional): Fiscal quarter (1-4). Must be used with `--fy`.
-- `--fy` (optional): Fiscal year (YYYY). Must be used with `--q`.
+- `--q` (optional): Fiscal quarter (1-4). Must be used with `--fy`; both are required with `--transcript`.
+- `--fy` (optional): Fiscal year (YYYY). Must be used with `--q`; both are required with `--transcript`.
 - `--outdir` (optional): Output directory (default: `./sec_earnings_8k`).
 - `--user-agent` (optional): SEC requires a User-Agent with contact info.
 - `--ca-bundle` (optional): Path to a CA bundle (PEM) if your system certs are missing.
 - `--insecure` (optional): Disable TLS verification (not recommended).
 - `--pdf` (optional): Also save HTML exhibits as PDF (requires `wkhtmltopdf`). When PDF conversion succeeds, HTML files and the `img/` folder are removed.
 - `--debug` (optional): Print exhibit selection details and transcript search diagnostics.
-- `--transcript` (optional): Also download the Investing.com earnings call transcript as PDF.
-- Transcript PDFs are trimmed to remove the first page and the last 2 pages (requires `pypdf`).
+- `--transcript` (optional): Discover and download the exact Investing.com earnings call transcript.
+- Transcript PDFs can be trimmed with `--transcript-trim-first` and `--transcript-trim-last` (requires `pypdf`).
 - `--transcript-cookie` (optional): Investing.com cookie string. Saved to the cookie file for reuse.
-- `--transcript-cookie-file` (optional): Path to store the Investing.com cookie (default: `./.investing_cookie.txt` next to the script).
+- `--transcript-cookie-file` (optional): Override path for Investing.com cookie file (default: `.secrets/investing.cookie.txt`).
 - `--transcript-url` (optional): Direct transcript URL to skip search.
 
 ## Examples
@@ -106,27 +107,43 @@ python3 sec_earnings_8k.py --ticker COST --q 1 --fy 2026 --transcript --transcri
 ## Earnings call transcript guide
 
 When `--transcript` is used, the tool:
-- Searches DuckDuckGo for: `<TICKER> earnings call transcript Q<q> FY<fy> investing.com`.
-- If DuckDuckGo fails or is blocked, it retries the same query on Bing.
-- Opens the first Investing.com transcript result.
+- Searches Google News RSS for Investing.com transcript candidates using the SEC company name and exact fiscal period. It does not scrape DuckDuckGo.
+- Requires the Investing.com `Full transcript - Company (TICKER) Q# YYYY` heading to match the requested ticker, quarter, and fiscal year.
+- Rejects ambiguous or previous-quarter pages instead of saving a best-effort result.
+- Resolves the Google News result to its canonical Investing.com URL, tries browser-impersonated HTTP first, then uses a persistent Playwright Chromium profile when Investing.com returns a challenge or incomplete page.
 - Saves the transcript into the same output folder as the SEC filings.
 - If `--pdf` is set, it creates a PDF and removes the HTML (same behavior as SEC filings).
 - If `--pdf` is not set, it keeps the HTML only.
-- Trims the PDF to remove the first page and last 2 pages (requires `pypdf`).
+- Trims the PDF to remove first/last pages (defaults: first=1, last=2; configurable).
   - If `wkhtmltopdf` reports external resource load errors but still creates the PDF, the file is kept.
 
-Transcript search logs now distinguish:
-- Search results were loaded but no Investing.com transcript URL matched.
-- Search engine returned an anti-bot/challenge page.
-- Search response could not be parsed into result links.
-- Search request failed (network/HTTP error).
+With `--debug`, transcript logs include:
+- Accepted and rejected RSS candidates.
+- The resolved Investing.com URL.
+- Whether browser-impersonated HTTP, direct HTTP, or Playwright retrieved the page.
+- The exact transcript identity heading that passed validation.
 
-If both DuckDuckGo and Bing fail, the command exits non-zero and prints a multi-engine failure summary.
+If no exact candidate passes validation, the command exits non-zero.
 
-### Getting the Investing.com cookie
+### Browser fallback
 
-You need to be logged in on Investing.com. The tool will reuse a saved cookie, but if it is missing
-or expired it will prompt you. To obtain the cookie value from your browser:
+Playwright stores its reusable Investing.com browser session in
+`.secrets/investing-browser`. Headless Chromium is attempted first. If
+Investing.com still presents a security check in an interactive terminal, the
+tool opens a visible browser once and asks you to complete it. Later runs reuse
+that browser profile.
+
+### Cookies
+
+The default cookie file is `.secrets/investing.cookie.txt`.
+
+You can paste either:
+- A raw `Cookie:` header value, or
+- Netscape cookie file format (for example from "Get cookies.txt locally").
+
+The `--transcript-cookie-file` flag overrides this path.
+
+To obtain cookies from your browser:
 
 1. Open the transcript page in your browser (Brave/Chrome/Edge).
 2. Open DevTools (F12) and go to the **Network** tab.
@@ -135,8 +152,8 @@ or expired it will prompt you. To obtain the cookie value from your browser:
 5. In the right pane, open **Headers** → **Request Headers**.
 6. Copy the full value of **Cookie:** (everything after `Cookie:`).
 
-Paste the cookie at the prompt or pass it once via `--transcript-cookie`.
-It will be saved to `./.investing_cookie.txt` (or your custom `--transcript-cookie-file` path).
+Pass the cookie once via `--transcript-cookie`; it is saved for later direct
+HTTP attempts. The persistent Playwright profile is the preferred fallback.
 
 ### Transcript output naming
 

@@ -27,16 +27,20 @@ import zlib
 from datetime import datetime
 from html.parser import HTMLParser
 from typing import Iterable, Optional
+from xml.etree import ElementTree
 
 SEC_TICKER_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
-DUCKDUCKGO_HTML_SEARCH = "https://duckduckgo.com/html/?q={query}"
-BING_HTML_SEARCH = "https://www.bing.com/search?q={query}&setlang=en-us"
+GOOGLE_NEWS_RSS_SEARCH = (
+    "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US%3Aen"
+)
 SEARCH_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 DEFAULT_OUTDIR = "./sec_earnings_8k"
-DEFAULT_TRANSCRIPT_COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".investing_cookie.txt")
+DEFAULT_SECRETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".secrets")
+DEFAULT_TRANSCRIPT_COOKIE_FILE = os.path.join(DEFAULT_SECRETS_DIR, "investing.cookie.txt")
+DEFAULT_TRANSCRIPT_BROWSER_PROFILE = os.path.join(DEFAULT_SECRETS_DIR, "investing-browser")
 DEFAULT_TRANSCRIPT_STEM = "earnings_call_transcript"
 
 
@@ -78,13 +82,17 @@ def _normalize_ticker(ticker: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", ticker.upper())
 
 
-def _ticker_to_cik(ticker: str, user_agent: str, ssl_context: Optional[ssl.SSLContext]) -> str:
+def _ticker_to_cik_and_title(
+    ticker: str,
+    user_agent: str,
+    ssl_context: Optional[ssl.SSLContext],
+) -> tuple[str, str]:
     data = _load_json(SEC_TICKER_URL, user_agent, ssl_context)
     norm = _normalize_ticker(ticker)
     for _, entry in data.items():
         if _normalize_ticker(entry.get("ticker", "")) == norm:
             cik_num = int(entry["cik_str"])
-            return f"{cik_num:010d}"
+            return f"{cik_num:010d}", str(entry.get("title", "") or "")
     raise ValueError(f"Ticker not found: {ticker}")
 
 
@@ -456,243 +464,300 @@ def _trim_pdf_pages(pdf_path: str, trim_first: int, trim_last: int) -> bool:
     return True
 
 
-def _build_transcript_query(ticker: str, q: Optional[int], fy: Optional[int]) -> str:
-    parts = [ticker, "earnings call transcript"]
-    if q is not None and fy is not None:
-        parts.append(f"Q{q} FY{fy}")
-    parts.append("investing.com")
-    return " ".join(parts)
+_COMPANY_STOP_WORDS = {
+    "class",
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "group",
+    "holding",
+    "holdings",
+    "inc",
+    "incorporated",
+    "limited",
+    "ltd",
+    "new",
+    "nv",
+    "plc",
+    "sa",
+    "the",
+}
 
 
-class _DDGResultParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.urls: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
-        if tag.lower() != "a":
-            return
-        href = None
-        class_attr = ""
-        for key, value in attrs:
-            if key.lower() == "href":
-                href = value
-            elif key.lower() == "class" and value:
-                class_attr = value
-        if href and "result__a" in class_attr:
-            self.urls.append(href)
+def _normalize_company_text(value: str) -> str:
+    joined_compounds = re.sub(r"(?<=\w)[&\-](?=\w)", "", value.lower())
+    normalized = re.sub(r"[^a-z0-9 ]", " ", joined_compounds)
+    return re.sub(r"\b([a-z]{1,3})\s+(\d{1,3})\b", r"\1\2", normalized)
 
 
-def _extract_ddg_result_urls(html: str) -> list[str]:
-    parser = _DDGResultParser()
-    parser.feed(html)
-    return parser.urls
-
-
-def _extract_bing_result_urls(html: str) -> list[str]:
-    urls: list[str] = []
-    for block in re.findall(r'<li[^>]+class="[^"]*b_algo[^"]*"[^>]*>.*?</li>', html, re.I | re.S):
-        match = re.search(r'<h2>\s*<a[^>]+href="([^"]+)"', block, re.I | re.S)
-        if match:
-            urls.append(match.group(1))
-    return urls
-
-
-def _normalize_ddg_url(url: str) -> str:
-    url = html_lib.unescape(url)
-    if url.startswith("/l/?") or "duckduckgo.com/l/?" in url:
-        parsed = urllib.parse.urlparse(url)
-        qs = urllib.parse.parse_qs(parsed.query)
-        if "uddg" in qs and qs["uddg"]:
-            return qs["uddg"][0]
-    return url
-
-
-def _normalize_bing_url(url: str) -> str:
-    return html_lib.unescape(url)
-
-
-def _is_investing_transcript_url(url: str) -> bool:
-    parsed = urllib.parse.urlparse(url)
-    if not parsed.netloc or "investing.com" not in parsed.netloc:
-        return False
-    return "/news/transcripts/" in parsed.path
-
-
-def _looks_like_ddg_block_page(html: str) -> bool:
-    lower = html.lower()
-    markers = [
-        "bots use duckduckgo too",
-        "anomaly-modal",
-        "please complete the following challenge",
-        "anomaly.js",
+def _company_tokens(company_title: str) -> list[str]:
+    normalized = _normalize_company_text(company_title)
+    return [
+        token
+        for token in normalized.split()
+        if len(token) > 2 and token not in _COMPANY_STOP_WORDS
     ]
-    return any(marker in lower for marker in markers)
 
 
-def _looks_like_bing_block_page(html: str) -> bool:
-    lower = html.lower()
-    markers = [
-        "our systems have detected unusual traffic",
-        "verify you are a human",
-        "captcha",
-        "bing.com/challenge",
-    ]
-    return any(marker in lower for marker in markers)
+def _company_search_name(company_title: str) -> str:
+    return " ".join(_company_tokens(company_title))
 
 
-def _run_search_attempt(
-    *,
-    engine: str,
-    search_url: str,
-    query: str,
-    ssl_context: Optional[ssl.SSLContext],
-    result_extractor,
-    url_normalizer,
-    block_detector,
-    no_results_markers: list[str],
-) -> dict:
-    attempt: dict[str, object] = {
-        "engine": engine,
-        "query": query,
-        "search_url": search_url,
-        "status": "network_error",
-        "detail": "",
-        "transcript_url": None,
-        "raw_result_count": 0,
-    }
-    try:
-        html = _http_get(search_url, SEARCH_USER_AGENT, ssl_context).decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        attempt["status"] = "network_error"
-        attempt["detail"] = f"HTTP {exc.code}"
-        return attempt
-    except urllib.error.URLError as exc:
-        attempt["status"] = "network_error"
-        attempt["detail"] = str(exc.reason)
-        return attempt
-    except Exception as exc:
-        attempt["status"] = "network_error"
-        attempt["detail"] = str(exc)
-        return attempt
-
-    if block_detector(html):
-        attempt["status"] = "bot_blocked"
-        attempt["detail"] = "Challenge/anti-bot page detected."
-        return attempt
-
-    raw_urls = result_extractor(html)
-    attempt["raw_result_count"] = len(raw_urls)
-    normalized_urls = [url_normalizer(u) for u in raw_urls]
-
-    for normalized in normalized_urls:
-        if _is_investing_transcript_url(normalized):
-            attempt["status"] = "found"
-            attempt["transcript_url"] = normalized
-            attempt["detail"] = "Found Investing.com transcript URL."
-            return attempt
-
-    if normalized_urls:
-        attempt["status"] = "no_relevant_result"
-        attempt["detail"] = (
-            f"Parsed {len(normalized_urls)} results but none matched an Investing.com transcript URL."
-        )
-        return attempt
-
-    lower = html.lower()
-    if any(marker in lower for marker in no_results_markers):
-        attempt["status"] = "no_relevant_result"
-        attempt["detail"] = "Search page loaded but reported no matching results."
-    else:
-        attempt["status"] = "parse_failed"
-        attempt["detail"] = "Search page did not expose parseable result links."
-    return attempt
+def _build_transcript_query(ticker: str, company_title: str, q: int, fy: int) -> str:
+    company = _company_search_name(company_title)
+    identity = f"{company} {ticker}" if company else ticker
+    return f'site:investing.com/news/transcripts {identity} "Q{q} {fy}"'
 
 
-def _log_search_attempt(attempt: dict, debug: bool) -> None:
-    engine = str(attempt.get("engine"))
-    status = str(attempt.get("status"))
-    detail = str(attempt.get("detail") or "")
-    if status == "found":
-        print(f"Transcript search ({engine}): found candidate URL.")
-        if debug:
-            print(f"  URL: {attempt.get('transcript_url')}")
-        return
-    if status == "no_relevant_result":
-        print(f"Transcript search ({engine}): results loaded, but no Investing.com transcript URL was found.")
-    elif status == "bot_blocked":
-        print(f"Transcript search ({engine}): blocked by anti-bot challenge.")
-    elif status == "parse_failed":
-        print(f"Transcript search ({engine}): could not parse usable search results.")
-    else:
-        print(f"Transcript search ({engine}): request failed.")
-    if detail and (debug or status in {"bot_blocked", "network_error"}):
-        print(f"  Detail: {detail}")
-    if debug:
-        print(f"  Query: {attempt.get('query')}")
-        print(f"  Search URL: {attempt.get('search_url')}")
-        print(f"  Raw results parsed: {attempt.get('raw_result_count')}")
+def _title_has_period(title: str, q: int, fy: int) -> bool:
+    return bool(re.search(rf"\bq\s*{q}\s+(?:fy\s*)?{fy}\b", title, re.I))
 
 
-def _format_transcript_search_failure(query: str, attempts: list[dict]) -> str:
-    lines = [
-        "Transcript search failed after trying multiple engines.",
-        f"Query: {query}",
-    ]
-    for attempt in attempts:
-        lines.append(
-            f"- {attempt.get('engine')}: {attempt.get('status')} ({attempt.get('detail')})"
-        )
-    lines.append("Try again later, pass --transcript-url, or run with --debug for more detail.")
-    return "\n".join(lines)
+def _company_title_score(title: str, ticker: str, company_title: str) -> int:
+    normalized_title = _normalize_company_text(title)
+    title_tokens = set(normalized_title.split())
+    company = _company_tokens(company_title)
+    matches = sum(1 for token in company if token in title_tokens)
+    score = matches * 10
+    if company and " ".join(company) in normalized_title:
+        score += 25
+    if _normalize_ticker(ticker).lower() in title_tokens:
+        score += 5
+    return score
 
 
-def _search_investing_transcript_url(
+def _parse_google_news_candidates(
+    rss_bytes: bytes,
     ticker: str,
-    q: Optional[int],
-    fy: Optional[int],
-    ssl_context: Optional[ssl.SSLContext],
+    company_title: str,
+    q: int,
+    fy: int,
     debug: bool = False,
-) -> str:
-    query = _build_transcript_query(ticker, q, fy)
-    encoded_query = urllib.parse.quote_plus(query)
-    attempts: list[dict] = []
+) -> list[dict]:
+    try:
+        root = ElementTree.fromstring(rss_bytes)
+    except ElementTree.ParseError as exc:
+        raise TranscriptSearchError(f"Google News returned invalid RSS: {exc}") from exc
 
-    ddg_attempt = _run_search_attempt(
-        engine="DuckDuckGo",
-        search_url=DUCKDUCKGO_HTML_SEARCH.format(query=encoded_query),
-        query=query,
-        ssl_context=ssl_context,
-        result_extractor=_extract_ddg_result_urls,
-        url_normalizer=_normalize_ddg_url,
-        block_detector=_looks_like_ddg_block_page,
-        no_results_markers=["no results found", "no more results"],
+    candidates: list[dict] = []
+    for item in root.findall("./channel/item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        source_element = item.find("source")
+        source = (source_element.text or "").strip() if source_element is not None else ""
+        source_url = source_element.get("url", "") if source_element is not None else ""
+        reason = ""
+        if source.lower() != "investing.com" and "investing.com" not in source_url.lower():
+            reason = "source is not Investing.com"
+        elif not _title_has_period(title, q, fy):
+            reason = "title does not contain the exact period"
+        else:
+            score = _company_title_score(title, ticker, company_title)
+            if score <= 0:
+                reason = "title does not identify the requested company"
+            elif link:
+                candidates.append(
+                    {
+                        "title": title,
+                        "url": html_lib.unescape(link),
+                        "published": (item.findtext("pubDate") or "").strip(),
+                        "score": score,
+                    }
+                )
+                if debug:
+                    print(f"  Accepted RSS candidate ({score}): {title}")
+                continue
+            else:
+                reason = "result has no URL"
+        if debug:
+            print(f"  Rejected RSS item: {title or '(untitled)'} ({reason})")
+
+    candidates.sort(key=lambda candidate: int(candidate["score"]), reverse=True)
+    return candidates
+
+
+def _search_investing_transcripts(
+    ticker: str,
+    company_title: str,
+    q: int,
+    fy: int,
+    ssl_context: Optional[ssl.SSLContext],
+    debug: bool,
+) -> list[dict]:
+    query = _build_transcript_query(ticker, company_title, q, fy)
+    search_url = GOOGLE_NEWS_RSS_SEARCH.format(query=urllib.parse.quote_plus(query))
+    if debug:
+        print(f"Transcript discovery query: {query}")
+        print(f"Transcript discovery URL: {search_url}")
+    try:
+        rss_bytes = _http_get(search_url, SEARCH_USER_AGENT, ssl_context)
+    except urllib.error.HTTPError as exc:
+        raise TranscriptSearchError(f"Google News transcript discovery failed: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise TranscriptSearchError(f"Google News transcript discovery failed: {exc.reason}") from exc
+    candidates = _parse_google_news_candidates(
+        rss_bytes,
+        ticker=ticker,
+        company_title=company_title,
+        q=q,
+        fy=fy,
+        debug=debug,
     )
-    attempts.append(ddg_attempt)
-    _log_search_attempt(ddg_attempt, debug)
-    if ddg_attempt.get("status") == "found":
-        return str(ddg_attempt["transcript_url"])
-
-    print("Transcript search: trying fallback engine (Bing).")
-    bing_attempt = _run_search_attempt(
-        engine="Bing",
-        search_url=BING_HTML_SEARCH.format(query=encoded_query),
-        query=query,
-        ssl_context=ssl_context,
-        result_extractor=_extract_bing_result_urls,
-        url_normalizer=_normalize_bing_url,
-        block_detector=_looks_like_bing_block_page,
-        no_results_markers=["there are no results for", "did not match any documents"],
-    )
-    attempts.append(bing_attempt)
-    _log_search_attempt(bing_attempt, debug)
-    if bing_attempt.get("status") == "found":
-        return str(bing_attempt["transcript_url"])
-
-    raise TranscriptSearchError(_format_transcript_search_failure(query, attempts))
+    if not candidates:
+        raise TranscriptSearchError(
+            "Google News returned no exact Investing.com transcript match for "
+            f"{ticker} Q{q} FY{fy}. Try --transcript-url or --debug."
+        )
+    print(f"Transcript discovery: found {len(candidates)} exact-period Investing.com candidate(s).")
+    return candidates
 
 
-def _read_cookie_file(path: str) -> Optional[str]:
+def _resolve_google_news_url(
+    article_url: str,
+    ssl_context: Optional[ssl.SSLContext],
+) -> Optional[str]:
+    parsed = urllib.parse.urlparse(article_url)
+    if parsed.netloc != "news.google.com" or "/rss/articles/" not in parsed.path:
+        return article_url
+    article_id = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+    try:
+        page_text = _http_get(
+            article_url, SEARCH_USER_AGENT, ssl_context
+        ).decode("utf-8", errors="replace")
+        signature_match = re.search(r'data-n-a-sg="([^"]+)"', page_text)
+        timestamp_match = re.search(r'data-n-a-ts="([^"]+)"', page_text)
+        if not signature_match or not timestamp_match:
+            return None
+
+        rpc_inner = json.dumps(
+            [
+                "garturlreq",
+                [
+                    [
+                        "X",
+                        "X",
+                        ["X", "X"],
+                        None,
+                        None,
+                        1,
+                        1,
+                        "US:en",
+                        None,
+                        1,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        0,
+                        1,
+                    ],
+                    "X",
+                    "X",
+                    1,
+                    [1, 1, 1],
+                    1,
+                    1,
+                    None,
+                    0,
+                    0,
+                    None,
+                    0,
+                ],
+                article_id,
+                int(timestamp_match.group(1)),
+                signature_match.group(1),
+            ],
+            separators=(",", ":"),
+        )
+        f_req = json.dumps(
+            [[["Fbv4je", rpc_inner, None, "generic"]]],
+            separators=(",", ":"),
+        )
+        post_data = urllib.parse.urlencode({"f.req": f_req}).encode("ascii")
+        request = urllib.request.Request(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+            data=post_data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "Referer": "https://news.google.com/",
+                "User-Agent": SEARCH_USER_AGENT,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(
+            request, timeout=30, context=ssl_context
+        ) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except (ValueError, urllib.error.HTTPError, urllib.error.URLError):
+        return None
+
+    if body.startswith(")]}'"):
+        body = body.split("\n", 1)[1]
+    body = body.lstrip()
+    head, separator, tail = body.partition("\n")
+    if separator and head.strip().isdigit():
+        body = tail
+    try:
+        envelopes = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    for envelope in envelopes:
+        if (
+            isinstance(envelope, list)
+            and len(envelope) >= 3
+            and envelope[0] == "wrb.fr"
+            and envelope[1] == "Fbv4je"
+        ):
+            try:
+                payload = json.loads(envelope[2])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if payload and payload[0] == "garturlres":
+                resolved = str(payload[1])
+                return resolved if _is_investing_transcript_url(resolved) else None
+    return None
+
+
+def _parse_netscape_cookie_file(cookie_text: str, url: str) -> Optional[str]:
+    parsed_url = urllib.parse.urlparse(url)
+    host = (parsed_url.netloc or "").lower()
+    path = parsed_url.path or "/"
+    if not host:
+        return None
+
+    def domain_matches(hostname: str, cookie_domain: str) -> bool:
+        cd = cookie_domain.lstrip(".").lower()
+        return hostname == cd or hostname.endswith(f".{cd}")
+
+    cookies: list[str] = []
+    now = int(time.time())
+    for raw_line in cookie_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 7:
+            continue
+        domain, _, cookie_path, secure, expires, name, value = parts
+        if not name:
+            continue
+        if secure.upper() == "TRUE" and parsed_url.scheme != "https":
+            continue
+        if cookie_path and not path.startswith(cookie_path):
+            continue
+        if not domain_matches(host, domain):
+            continue
+        if expires.isdigit() and int(expires) not in {0, 2147483647} and int(expires) < now:
+            continue
+        cookies.append(f"{name}={value}")
+    if not cookies:
+        return None
+    return "; ".join(cookies)
+
+
+def _read_cookie_file(path: str, url: str) -> Optional[str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             cookie = f.read().strip()
@@ -700,6 +765,8 @@ def _read_cookie_file(path: str) -> Optional[str]:
         return None
     if not cookie:
         return None
+    if cookie.startswith("# Netscape HTTP Cookie File") or "\t" in cookie:
+        return _parse_netscape_cookie_file(cookie, url)
     return cookie
 
 
@@ -709,139 +776,504 @@ def _write_cookie_file(path: str, cookie: str) -> None:
         f.write(cookie.strip())
 
 
-def _prompt_for_cookie() -> Optional[str]:
-    help_text = (
-        "To get the Investing.com cookie from your browser:\n"
-        "  1) Open the transcript page in your browser.\n"
-        "  2) Open DevTools (F12) and go to the Network tab.\n"
-        "  3) Refresh the page, click the main document request.\n"
-        "  4) In Request Headers, copy the full 'Cookie' value.\n"
-        "You can pass it once via --transcript-cookie or paste it here.\n"
-    )
-    if not sys.stdin.isatty():
-        print(help_text)
-        print("Non-interactive session: pass --transcript-cookie or use --transcript-cookie-file.")
-        return None
-    print(help_text)
-    try:
-        cookie = input("Enter Investing.com cookie (leave blank to skip): ").strip()
-    except EOFError:
-        return None
-    return cookie or None
-
-
-def _looks_like_auth_wall(html: str) -> bool:
+def _looks_like_access_challenge(html: str) -> bool:
     lower = html.lower()
-    if "transcript" in lower:
-        return False
-    if "sign in" in lower or "log in" in lower or "subscribe" in lower:
-        return True
-    return False
+    markers = [
+        "cf-chl-",
+        "<title>just a moment",
+        "id=\"challenge-running\"",
+        "id='challenge-running'",
+        "please verify you are a human",
+        "performing security verification",
+    ]
+    return any(marker in lower for marker in markers)
 
 
-def _download_investing_transcript(
+def _is_investing_transcript_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.netloc or "").lower()
+    return (
+        (host == "investing.com" or host.endswith(".investing.com"))
+        and "/news/transcripts/" in parsed.path
+    )
+
+
+class _TranscriptIdentityParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._capture_tag: Optional[str] = None
+        self._parts: list[str] = []
+        self.headings: list[str] = []
+        self.title = ""
+        self.canonical_url = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        tag_lower = tag.lower()
+        attr_map = {key.lower(): value or "" for key, value in attrs}
+        if tag_lower in {"title", "h1", "h2", "h3"}:
+            self._capture_tag = tag_lower
+            self._parts = []
+        if tag_lower == "link" and attr_map.get("rel", "").lower() == "canonical":
+            self.canonical_url = attr_map.get("href", "")
+        if tag_lower == "meta" and attr_map.get("property", "").lower() == "og:title":
+            self.title = attr_map.get("content", "")
+
+    def handle_data(self, data: str) -> None:
+        if self._capture_tag:
+            self._parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._capture_tag != tag.lower():
+            return
+        text = " ".join("".join(self._parts).split())
+        if self._capture_tag == "title" and not self.title:
+            self.title = text
+        elif self._capture_tag in {"h1", "h2", "h3"} and text:
+            self.headings.append(text)
+        self._capture_tag = None
+        self._parts = []
+
+
+def _extract_transcript_identity(html_text: str) -> dict:
+    parser = _TranscriptIdentityParser()
+    parser.feed(html_text)
+    pattern = re.compile(
+        r"full\s+transcript\s*[-–—:]\s*(?P<company>.+?)\s*"
+        r"\(\s*(?P<ticker>[A-Z0-9.\-]+)\s*\)\s*"
+        r"(?:fiscal\s*)?Q\s*(?P<q>[1-4])\s*(?:FY\s*)?(?P<fy>20\d{2})\b",
+        re.I,
+    )
+    for heading in parser.headings:
+        match = pattern.search(heading)
+        if match:
+            return {
+                "company": match.group("company").strip(),
+                "ticker": _normalize_ticker(match.group("ticker")),
+                "q": int(match.group("q")),
+                "fy": int(match.group("fy")),
+                "heading": heading,
+                "title": parser.title,
+                "canonical_url": parser.canonical_url,
+            }
+    return {
+        "company": "",
+        "ticker": "",
+        "q": None,
+        "fy": None,
+        "heading": "",
+        "title": parser.title,
+        "canonical_url": parser.canonical_url,
+    }
+
+
+def _validate_transcript_identity(
+    html_text: str,
     ticker: str,
+    company_title: str,
+    q: int,
+    fy: int,
+) -> tuple[bool, str, dict]:
+    if _looks_like_access_challenge(html_text):
+        return False, "access challenge detected", {}
+    identity = _extract_transcript_identity(html_text)
+    if not identity["heading"]:
+        return False, "rendered Full transcript heading was not found", identity
+    expected_ticker = _normalize_ticker(ticker)
+    if identity["ticker"] != expected_ticker:
+        return False, f"ticker is {identity['ticker']}, expected {expected_ticker}", identity
+    if identity["q"] != q or identity["fy"] != fy:
+        return (
+            False,
+            f"period is Q{identity['q']} FY{identity['fy']}, expected Q{q} FY{fy}",
+            identity,
+        )
+    if _company_title_score(str(identity["company"]), ticker, company_title) <= 0:
+        return False, "transcript heading does not identify the requested company", identity
+    return True, "exact transcript identity matched", identity
+
+
+def _http_get_with_final_url(
+    url: str,
+    user_agent: str,
+    ssl_context: Optional[ssl.SSLContext],
+    extra_headers: Optional[dict[str, str]] = None,
+) -> tuple[bytes, str]:
+    headers = {
+        "User-Agent": user_agent,
+        "Accept-Encoding": "gzip, deflate",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
+        data = resp.read()
+        encoding = (resp.headers.get("Content-Encoding") or "").lower()
+        if encoding == "gzip":
+            data = gzip.decompress(data)
+        elif encoding == "deflate":
+            data = zlib.decompress(data)
+        return data, resp.geturl()
+
+
+def _impersonated_http_get(
+    url: str,
+    headers: dict[str, str],
+    ssl_context: Optional[ssl.SSLContext],
+) -> tuple[bytes, str]:
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:
+        raise RuntimeError("curl_cffi is not installed") from exc
+    verify = not (
+        ssl_context is not None and ssl_context.verify_mode == ssl.CERT_NONE
+    )
+    response = curl_requests.get(
+        url,
+        headers=headers,
+        impersonate="chrome",
+        allow_redirects=True,
+        timeout=30,
+        verify=verify,
+    )
+    response.raise_for_status()
+    return response.content, str(response.url)
+
+
+def _playwright_fetch_once(
+    url: str,
+    user_agent: str,
+    profile_dir: str,
+    headless: bool,
+) -> tuple[str, str]:
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "Playwright is required after Investing.com blocks direct HTTP. "
+            "Install it with 'pip install playwright' and 'playwright install chromium'."
+        ) from exc
+
+    os.makedirs(profile_dir, exist_ok=True)
+    with sync_playwright() as playwright:
+        launch_options = {
+            "headless": headless,
+            "locale": "en-US",
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                profile_dir,
+                channel="chrome",
+                **launch_options,
+            )
+        except Exception:
+            context = playwright.chromium.launch_persistent_context(
+                profile_dir,
+                **launch_options,
+            )
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.get_by_text("Full transcript", exact=False).first.wait_for(timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+            return page.content(), page.url
+        finally:
+            context.close()
+
+
+def _playwright_fetch_interactive(
+    url: str,
+    user_agent: str,
+    profile_dir: str,
+) -> tuple[str, str]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "Playwright is required after Investing.com blocks direct HTTP. "
+            "Install it with 'pip install playwright' and 'playwright install chromium'."
+        ) from exc
+
+    os.makedirs(profile_dir, exist_ok=True)
+    with sync_playwright() as playwright:
+        launch_options = {
+            "headless": False,
+            "locale": "en-US",
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                profile_dir,
+                channel="chrome",
+                **launch_options,
+            )
+        except Exception:
+            context = playwright.chromium.launch_persistent_context(
+                profile_dir,
+                **launch_options,
+            )
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            print("Complete the Investing.com security check in the browser window.")
+            input("Press Enter after the transcript is visible: ")
+            return page.content(), page.url
+        finally:
+            context.close()
+
+
+def _fetch_transcript_page(
+    url: str,
+    ticker: str,
+    company_title: str,
+    q: int,
+    fy: int,
+    user_agent: str,
+    ssl_context: Optional[ssl.SSLContext],
+    cookie: Optional[str],
+    debug: bool,
+) -> tuple[Optional[str], Optional[str], str]:
+    headers = {"Accept-Language": "en-US,en;q=0.9"}
+    if cookie and _is_investing_transcript_url(url):
+        headers["Cookie"] = cookie
+    browser_url = url
+    http_reason = ""
+    if _is_investing_transcript_url(url):
+        try:
+            html_bytes, final_url = _impersonated_http_get(url, headers, ssl_context)
+            html_text = html_bytes.decode("utf-8", errors="replace")
+            valid, reason, identity = _validate_transcript_identity(
+                html_text, ticker, company_title, q, fy
+            )
+            if valid:
+                if debug:
+                    print(f"Transcript retrieval: impersonated HTTP ({final_url})")
+                    print(f"  Validated identity: {identity['heading']}")
+                return html_text, final_url, "impersonated HTTP"
+            http_reason = reason
+            if identity.get("heading"):
+                return None, final_url, reason
+        except Exception as exc:
+            http_reason = str(exc)
+    try:
+        html_bytes, final_url = _http_get_with_final_url(
+            url,
+            user_agent,
+            ssl_context,
+            extra_headers=headers,
+        )
+        browser_url = final_url
+        html_text = html_bytes.decode("utf-8", errors="replace")
+        valid, reason, identity = _validate_transcript_identity(
+            html_text, ticker, company_title, q, fy
+        )
+        if valid and _is_investing_transcript_url(final_url):
+            if debug:
+                print(f"Transcript retrieval: direct HTTP ({final_url})")
+                print(f"  Validated identity: {identity['heading']}")
+            return html_text, final_url, "direct HTTP"
+        http_reason = reason
+        if identity.get("heading"):
+            if debug:
+                print(f"Transcript candidate rejected: {reason}")
+            return None, final_url, reason
+    except urllib.error.HTTPError as exc:
+        browser_url = exc.geturl() or url
+        http_reason = f"HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        http_reason = str(exc.reason)
+    except Exception as exc:
+        http_reason = str(exc)
+
+    if cookie and _is_investing_transcript_url(browser_url) and "Cookie" not in headers:
+        cookie_headers = dict(headers)
+        cookie_headers["Cookie"] = cookie
+        try:
+            html_bytes, final_url = _http_get_with_final_url(
+                browser_url,
+                user_agent,
+                ssl_context,
+                extra_headers=cookie_headers,
+            )
+            html_text = html_bytes.decode("utf-8", errors="replace")
+            valid, reason, identity = _validate_transcript_identity(
+                html_text, ticker, company_title, q, fy
+            )
+            if valid:
+                if debug:
+                    print(f"Transcript retrieval: direct HTTP with cookie ({final_url})")
+                    print(f"  Validated identity: {identity['heading']}")
+                return html_text, final_url, "direct HTTP with cookie"
+            http_reason = reason
+            if identity.get("heading"):
+                return None, final_url, reason
+        except urllib.error.HTTPError as exc:
+            http_reason = f"HTTP {exc.code} with saved cookie"
+        except urllib.error.URLError as exc:
+            http_reason = str(exc.reason)
+        except Exception as exc:
+            http_reason = str(exc)
+
+    if debug:
+        print(f"Transcript retrieval: direct HTTP unavailable ({http_reason}); trying Playwright.")
+    try:
+        html_text, final_url = _playwright_fetch_once(
+            browser_url,
+            user_agent,
+            DEFAULT_TRANSCRIPT_BROWSER_PROFILE,
+            headless=True,
+        )
+    except Exception as exc:
+        return None, browser_url, f"Playwright failed: {exc}"
+
+    valid, reason, identity = _validate_transcript_identity(
+        html_text, ticker, company_title, q, fy
+    )
+    if not valid and _looks_like_access_challenge(html_text) and sys.stdin.isatty():
+        try:
+            html_text, final_url = _playwright_fetch_interactive(
+                browser_url,
+                user_agent,
+                DEFAULT_TRANSCRIPT_BROWSER_PROFILE,
+            )
+        except Exception as exc:
+            return None, browser_url, f"headed Playwright failed: {exc}"
+        valid, reason, identity = _validate_transcript_identity(
+            html_text, ticker, company_title, q, fy
+        )
+    if not valid:
+        return None, final_url, reason
+    if not _is_investing_transcript_url(final_url):
+        return None, final_url, "browser did not resolve to an Investing.com transcript URL"
+    if debug:
+        print(f"Transcript retrieval: Playwright ({final_url})")
+        print(f"  Validated identity: {identity['heading']}")
+    return html_text, final_url, "Playwright"
+
+
+def _download_transcript(
+    ticker: str,
+    company_title: str,
     q: Optional[int],
     fy: Optional[int],
     out_base: str,
     user_agent: str,
     ssl_context: Optional[ssl.SSLContext],
     transcript_url: Optional[str],
-    cookie_file: str,
+    transcript_cookie_file: Optional[str],
     cookie_value: Optional[str],
     save_pdf: bool,
+    trim_first: int,
+    trim_last: int,
     debug: bool,
 ) -> bool:
-    url = transcript_url
-    if not url:
-        url = _search_investing_transcript_url(
+    if q is None or fy is None:
+        raise TranscriptSearchError(
+            "Investing.com transcript discovery requires both --q and --fy."
+        )
+
+    candidate_list: list[dict] = []
+    if transcript_url:
+        if not _is_investing_transcript_url(transcript_url):
+            raise TranscriptSearchError(
+                "--transcript-url must be an Investing.com /news/transcripts/ URL."
+            )
+        candidate_list.append(
+            {"title": "direct URL", "url": transcript_url, "score": 1000}
+        )
+    else:
+        candidate_list = _search_investing_transcripts(
             ticker=ticker,
+            company_title=company_title,
             q=q,
             fy=fy,
             ssl_context=ssl_context,
             debug=debug,
         )
 
-    cookie = cookie_value
-    if cookie:
-        _write_cookie_file(cookie_file, cookie)
-    if not cookie:
-        cookie = _read_cookie_file(cookie_file)
-    if not cookie:
-        cookie = _prompt_for_cookie()
-        if cookie:
-            _write_cookie_file(cookie_file, cookie)
-    if not cookie:
-        print("Transcript download skipped (no cookie provided).")
-        return False
-
-    last_error: Optional[str] = None
-    for attempt in range(2):
-        try:
-            html_bytes = _http_get(
-                url,
-                user_agent,
-                ssl_context,
-                extra_headers={
-                    "Cookie": cookie,
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            )
-        except urllib.error.HTTPError as exc:
-            if exc.code in {401, 403}:
-                last_error = f"HTTP {exc.code}"
-            else:
-                print(f"Transcript download failed: HTTP {exc.code}")
-                return False
-        else:
-            html_text = html_bytes.decode("utf-8", errors="replace")
-            if not _looks_like_auth_wall(html_text):
-                file_prefix = _file_prefix(ticker, q, fy)
-                html_path = os.path.join(out_base, f"{file_prefix}{DEFAULT_TRANSCRIPT_STEM}.html")
-                with open(html_path, "w", encoding="utf-8") as f:
-                    f.write(html_text)
-                if save_pdf:
-                    pdf_path = os.path.splitext(html_path)[0] + ".pdf"
+    cookie_file = transcript_cookie_file or DEFAULT_TRANSCRIPT_COOKIE_FILE
+    if cookie_value:
+        _write_cookie_file(cookie_file, cookie_value)
+    failures: list[str] = []
+    for candidate in candidate_list:
+        url = str(candidate["url"])
+        if not transcript_url:
+            resolved_url = _resolve_google_news_url(url, ssl_context)
+            if resolved_url:
+                url = resolved_url
+                if debug:
+                    print(f"  Resolved Investing.com URL: {url}")
+            elif debug:
+                print("  Google News URL resolution failed; browser navigation will be attempted.")
+        cookie = cookie_value or _read_cookie_file(
+            cookie_file, "https://www.investing.com/news/transcripts/"
+        )
+        if debug:
+            print(f"Trying transcript candidate: {candidate['title']}")
+            print(f"  URL: {url}")
+        html_text, final_url, method = _fetch_transcript_page(
+            url=url,
+            ticker=ticker,
+            company_title=company_title,
+            q=q,
+            fy=fy,
+            user_agent=user_agent,
+            ssl_context=ssl_context,
+            cookie=cookie,
+            debug=debug,
+        )
+        if not html_text:
+            failure = f"{candidate['title']}: {method}"
+            failures.append(failure)
+            if debug:
+                print(f"  Rejected: {method}")
+            continue
+        file_prefix = _file_prefix(ticker, q, fy)
+        html_path = os.path.join(out_base, f"{file_prefix}{DEFAULT_TRANSCRIPT_STEM}.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_text)
+        if save_pdf:
+            pdf_path = os.path.splitext(html_path)[0] + ".pdf"
+            try:
+                _convert_html_to_pdf(
+                    html_path,
+                    pdf_path,
+                    extra_args=[
+                        "--load-error-handling",
+                        "ignore",
+                        "--load-media-error-handling",
+                        "ignore",
+                    ],
+                    allow_failure_if_output=True,
+                )
+                if trim_first > 0 or trim_last > 0:
                     try:
-                        _convert_html_to_pdf(
-                            html_path,
-                            pdf_path,
-                            extra_args=[
-                                "--load-error-handling",
-                                "ignore",
-                                "--load-media-error-handling",
-                                "ignore",
-                            ],
-                            allow_failure_if_output=True,
-                        )
-                        try:
-                            _trim_pdf_pages(pdf_path, trim_first=1, trim_last=2)
-                        except Exception as exc:
-                            print(f"Transcript PDF trim failed: {exc}")
-                        print(f"Transcript saved: {pdf_path}")
-                        try:
-                            os.remove(html_path)
-                        except FileNotFoundError:
-                            pass
-                        except OSError:
-                            print(f"Could not remove transcript HTML: {html_path}")
+                        _trim_pdf_pages(pdf_path, trim_first=trim_first, trim_last=trim_last)
                     except Exception as exc:
-                        print(f"Transcript PDF conversion failed: {exc}")
-                        print(f"Transcript HTML retained: {html_path}")
-                else:
-                    print(f"Transcript saved: {html_path}")
-                return True
-            last_error = "auth wall detected"
+                        print(f"Transcript PDF trim failed: {exc}")
+                print(f"Transcript saved: {pdf_path}")
+                try:
+                    os.remove(html_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    print(f"Could not remove transcript HTML: {html_path}")
+            except Exception as exc:
+                print(f"Transcript PDF conversion failed: {exc}")
+                print(f"Transcript HTML retained: {html_path}")
+        else:
+            print(f"Transcript saved: {html_path}")
+        if debug:
+            print(f"Transcript source: {final_url} ({method})")
+        return True
 
-        if attempt == 0:
-            print(f"Transcript access failed ({last_error}). Please refresh cookie.")
-            cookie = _prompt_for_cookie()
-            if cookie:
-                _write_cookie_file(cookie_file, cookie)
-                continue
-        break
-
-    print("Transcript download failed; cookie may need refresh.")
+    print("Transcript download failed: no candidate passed exact identity validation.")
+    if debug:
+        for failure in failures:
+            print(f"  {failure}")
     return False
 
 
@@ -858,9 +1290,11 @@ def fetch_latest_earnings_8k(
     transcript_cookie_file: Optional[str] = None,
     transcript_cookie: Optional[str] = None,
     transcript_url: Optional[str] = None,
+    transcript_trim_first: int = 1,
+    transcript_trim_last: int = 2,
     debug: bool = False,
 ) -> int:
-    cik = _ticker_to_cik(ticker, user_agent, ssl_context)
+    cik, company_title = _ticker_to_cik_and_title(ticker, user_agent, ssl_context)
     submissions_url = SEC_SUBMISSIONS_URL.format(cik=cik)
     submissions = _load_json(submissions_url, user_agent, ssl_context)
 
@@ -999,21 +1433,25 @@ def fetch_latest_earnings_8k(
             if missing:
                 print("Missing exhibits:", ", ".join(missing))
             if transcript:
-                cookie_file = transcript_cookie_file or DEFAULT_TRANSCRIPT_COOKIE_FILE
                 try:
-                    _download_investing_transcript(
+                    transcript_saved = _download_transcript(
                         ticker=ticker,
+                        company_title=company_title,
                         q=q,
                         fy=fy,
                         out_base=out_base,
                         user_agent=user_agent,
                         ssl_context=ssl_context,
                         transcript_url=transcript_url,
-                        cookie_file=cookie_file,
+                        transcript_cookie_file=transcript_cookie_file,
                         cookie_value=transcript_cookie,
                         save_pdf=save_pdf,
+                        trim_first=transcript_trim_first,
+                        trim_last=transcript_trim_last,
                         debug=debug,
                     )
+                    if not transcript_saved:
+                        return 3
                 except TranscriptSearchError as exc:
                     print(str(exc))
                     return 3
@@ -1081,22 +1519,34 @@ def main() -> int:
     parser.add_argument(
         "--transcript",
         action="store_true",
-        help="Also download the Investing.com earnings call transcript as PDF.",
+        help="Also discover and download the exact Investing.com earnings call transcript.",
     )
     parser.add_argument(
         "--transcript-cookie",
         default=None,
-        help="Investing.com cookie string (optional; saved for future use).",
+        help="Cookie string override (mainly for Investing.com).",
     )
     parser.add_argument(
         "--transcript-cookie-file",
         default=None,
-        help=f"Path to store Investing.com cookie (default: {DEFAULT_TRANSCRIPT_COOKIE_FILE}).",
+        help=f"Optional Investing.com cookie file override (default: {DEFAULT_TRANSCRIPT_COOKIE_FILE}).",
     )
     parser.add_argument(
         "--transcript-url",
         default=None,
         help="Optional direct transcript URL to skip search.",
+    )
+    parser.add_argument(
+        "--transcript-trim-first",
+        type=int,
+        default=1,
+        help="Trim this many pages from the start of transcript PDFs (default: 1).",
+    )
+    parser.add_argument(
+        "--transcript-trim-last",
+        type=int,
+        default=2,
+        help="Trim this many pages from the end of transcript PDFs (default: 2).",
     )
     args = parser.parse_args()
 
@@ -1104,6 +1554,8 @@ def main() -> int:
     quarter_info = _validate_quarter_inputs(args.q, args.fy)
     q = quarter_info[0] if quarter_info else None
     fy = quarter_info[1] if quarter_info else None
+    if args.transcript_trim_first < 0 or args.transcript_trim_last < 0:
+        raise ValueError("--transcript-trim-first/--transcript-trim-last must be >= 0.")
 
     ssl_context: Optional[ssl.SSLContext]
     if args.insecure:
@@ -1125,6 +1577,8 @@ def main() -> int:
             transcript_cookie_file=args.transcript_cookie_file,
             transcript_cookie=args.transcript_cookie,
             transcript_url=args.transcript_url,
+            transcript_trim_first=args.transcript_trim_first,
+            transcript_trim_last=args.transcript_trim_last,
             debug=args.debug,
         )
     except urllib.error.URLError as exc:

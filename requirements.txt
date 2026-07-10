@@ -1,2 +1,4 @@
-# No third-party dependencies required.
+# Transcript browser fallback and optional PDF trimming.
+curl_cffi
+playwright
 pypdf>=4.0.0
