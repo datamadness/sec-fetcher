@@ -140,6 +140,45 @@ def _exhibit_score(name: str) -> int:
     return 0
 
 
+def _normalize_exhibit_type(file_type: str) -> Optional[str]:
+    normalized = re.sub(r"\s+", "", file_type.upper())
+    match = re.fullmatch(r"EX-?99\.?0*([12])", normalized)
+    if not match:
+        return None
+    return f"EX-99.{match.group(1)}"
+
+
+def _find_exhibit_files_from_submission(submission_text: str) -> dict:
+    found = {"EX-99.1": None, "EX-99.2": None}
+    scores = {"EX-99.1": -1, "EX-99.2": -1}
+    document_blocks = re.findall(
+        r"<DOCUMENT>(.*?)</DOCUMENT>", submission_text, flags=re.IGNORECASE | re.DOTALL
+    )
+    for block in document_blocks:
+        type_match = re.search(r"<TYPE>\s*([^\r\n<]+)", block, flags=re.IGNORECASE)
+        filename_match = re.search(r"<FILENAME>\s*([^\r\n<]+)", block, flags=re.IGNORECASE)
+        if not type_match or not filename_match:
+            continue
+        ex_code = _normalize_exhibit_type(type_match.group(1).strip())
+        filename = filename_match.group(1).strip()
+        if ex_code not in found or not filename:
+            continue
+        score = _exhibit_score(filename)
+        if score > scores[ex_code]:
+            found[ex_code] = filename
+            scores[ex_code] = score
+    return found
+
+
+def _is_sec_generated_html(name: str) -> bool:
+    basename = os.path.basename(name).lower()
+    if re.search(r"-index(?:-headers)?\.html?$", basename):
+        return True
+    if re.fullmatch(r"r\d+\.html?", basename):
+        return True
+    return basename in {"filingsummary.htm", "filingsummary.html"}
+
+
 def _find_exhibit_files(index_json: dict, primary_document: Optional[str] = None) -> dict:
     found = {"EX-99.1": None, "EX-99.2": None}
     scores = {"EX-99.1": -1, "EX-99.2": -1}
@@ -181,6 +220,8 @@ def _find_exhibit_files(index_json: dict, primary_document: Optional[str] = None
                 continue
             name_lower = name.lower()
             if primary_document and name_lower == primary_document.lower():
+                continue
+            if _is_sec_generated_html(name):
                 continue
             if any(token in name_lower for token in ["xsd", "xml", "xbrl", "json", "js", "css", "schema", "cal", "lab", "pre", "def", "summary"]):
                 continue
@@ -311,7 +352,11 @@ def _acceptance_datetime(accession: str, base_url: str, user_agent: str, ssl_con
     except urllib.error.HTTPError:
         return None
     text = data.decode("utf-8", errors="replace")
-    match = re.search(r"ACCEPTANCE-DATETIME[>:]\s*(\d{14})", text)
+    return _acceptance_datetime_from_submission(text)
+
+
+def _acceptance_datetime_from_submission(submission_text: str) -> Optional[str]:
+    match = re.search(r"ACCEPTANCE-DATETIME[>:]\s*(\d{14})", submission_text)
     if not match:
         return None
     raw = match.group(1)
@@ -1308,13 +1353,33 @@ def fetch_latest_earnings_8k(
     for candidate in candidates:
         accession = candidate["accession"]
         accession_nodash = accession.replace("-", "")
+        base_url = f"{SEC_ARCHIVES_BASE}/{int(cik)}/{accession_nodash}"
         index_url = f"{SEC_ARCHIVES_BASE}/{int(cik)}/{accession_nodash}/index.json"
         try:
             index_json = _load_json(index_url, user_agent, ssl_context)
         except urllib.error.HTTPError:
-            continue
+            index_json = {}
 
-        exhibits = _find_exhibit_files(index_json, primary_document=candidate.get("primary_document"))
+        submission_text: Optional[str] = None
+        try:
+            submission_data = _http_get(
+                f"{base_url}/{accession}.txt", user_agent, ssl_context
+            )
+            submission_text = submission_data.decode("utf-8", errors="replace")
+        except urllib.error.HTTPError:
+            pass
+
+        exhibits = (
+            _find_exhibit_files_from_submission(submission_text)
+            if submission_text is not None
+            else {"EX-99.1": None, "EX-99.2": None}
+        )
+        fallback_exhibits = _find_exhibit_files(
+            index_json, primary_document=candidate.get("primary_document")
+        )
+        for ex_code in exhibits:
+            if not exhibits[ex_code]:
+                exhibits[ex_code] = fallback_exhibits[ex_code]
         if debug:
             _debug_print_exhibit_mapping(index_json, exhibits)
         if not exhibits["EX-99.1"] and not exhibits["EX-99.2"]:
@@ -1323,11 +1388,14 @@ def fetch_latest_earnings_8k(
         saved = []
         ex99_1_paths: list[str] = []
         html_paths: list[str] = []
-        base_url = f"{SEC_ARCHIVES_BASE}/{int(cik)}/{accession_nodash}"
         out_base = os.path.join(outdir, _folder_name(ticker, q, fy))
         file_prefix = _file_prefix(ticker, q, fy)
         os.makedirs(out_base, exist_ok=True)
-        sec_filing_dt = _acceptance_datetime(accession, base_url, user_agent, ssl_context)
+        sec_filing_dt = (
+            _acceptance_datetime_from_submission(submission_text)
+            if submission_text is not None
+            else None
+        )
         meta_path = os.path.join(out_base, "sec_filing_info.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(
