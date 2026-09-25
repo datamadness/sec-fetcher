@@ -436,11 +436,17 @@ def _convert_html_to_pdf(
     if extra_args:
         cmd.extend(extra_args)
     cmd.extend([html_path, pdf_path])
+    if os.path.exists(pdf_path):
+        os.remove(pdf_path)
     result = subprocess.run(cmd, check=False)
     if result.returncode != 0:
-        if allow_failure_if_output and os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
-            print(f"wkhtmltopdf exited with code {result.returncode}; keeping generated PDF.")
-            return
+        if allow_failure_if_output and os.path.exists(pdf_path):
+            with open(pdf_path, "rb") as pdf:
+                if pdf.read(5) == b"%PDF-":
+                    pdf.seek(max(0, os.path.getsize(pdf_path) - 1024))
+                    if b"%%EOF" in pdf.read():
+                        print(f"wkhtmltopdf exited with code {result.returncode}; keeping generated PDF.")
+                        return
         raise RuntimeError(f"wkhtmltopdf failed with exit code {result.returncode}")
 
 
@@ -1349,6 +1355,8 @@ def fetch_latest_earnings_8k(
         return 1
 
     candidates.sort(key=lambda x: x["filing_date"] or "", reverse=True)
+    latest_filing_date = candidates[0]["filing_date"]
+    candidates = [candidate for candidate in candidates if candidate["filing_date"] == latest_filing_date]
 
     for candidate in candidates:
         accession = candidate["accession"]
@@ -1391,6 +1399,18 @@ def fetch_latest_earnings_8k(
         out_base = os.path.join(outdir, _folder_name(ticker, q, fy))
         file_prefix = _file_prefix(ticker, q, fy)
         os.makedirs(out_base, exist_ok=True)
+        stale_prefixes = [f"{file_prefix}8k_991.", f"{file_prefix}8k_992."]
+        if q is not None and fy is not None:
+            prev_q, prev_fy, _ = _prior_quarter_label(q, fy)
+            prior_prefix = _file_prefix(ticker, prev_q, prev_fy)
+            stale_prefixes.extend([f"{prior_prefix}10q.", f"{prior_prefix}10k."])
+        for filename in os.listdir(out_base):
+            is_stale_filing = filename.lower().startswith(tuple(stale_prefixes))
+            if is_stale_filing and filename.lower().endswith((".htm", ".html", ".pdf")):
+                os.remove(os.path.join(out_base, filename))
+        images_dir = os.path.join(out_base, "img")
+        if os.path.isdir(images_dir):
+            shutil.rmtree(images_dir)
         sec_filing_dt = (
             _acceptance_datetime_from_submission(submission_text)
             if submission_text is not None
@@ -1432,7 +1452,7 @@ def fetch_latest_earnings_8k(
                 if save_pdf and os.path.splitext(dest_path)[1].lower() in {".htm", ".html"}:
                     pdf_path = os.path.splitext(dest_path)[0] + ".pdf"
                     try:
-                        _convert_html_to_pdf(dest_path, pdf_path)
+                        _convert_html_to_pdf(dest_path, pdf_path, allow_failure_if_output=True)
                         saved.append(pdf_path)
                     except Exception as exc:
                         print(f"PDF conversion failed for {dest_path}: {exc}")
@@ -1466,7 +1486,7 @@ def fetch_latest_earnings_8k(
                 if save_pdf:
                     pdf_path = os.path.splitext(report_path)[0] + ".pdf"
                     try:
-                        _convert_html_to_pdf(report_path, pdf_path)
+                        _convert_html_to_pdf(report_path, pdf_path, allow_failure_if_output=True)
                         saved.append(pdf_path)
                     except Exception as exc:
                         print(f"PDF conversion failed for {report_path}: {exc}")
@@ -1475,7 +1495,7 @@ def fetch_latest_earnings_8k(
             retained_html = []
             for html_path in html_paths:
                 pdf_path = os.path.splitext(html_path)[0] + ".pdf"
-                if not os.path.exists(pdf_path):
+                if pdf_path not in saved:
                     retained_html.append(html_path)
                     continue
                 try:

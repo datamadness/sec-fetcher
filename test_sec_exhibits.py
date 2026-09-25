@@ -1,4 +1,8 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import sec_earnings_8k as fetcher
 
@@ -81,6 +85,45 @@ class DirectoryFallbackTests(unittest.TestCase):
             },
             fetcher._find_exhibit_files(index_json),
         )
+
+
+class FilingFetchTests(unittest.TestCase):
+    def test_keeps_newly_generated_pdf_when_renderer_reports_missing_resource(self) -> None:
+        with TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "filing.pdf"
+            pdf_path.write_bytes(b"stale")
+
+            def render(*args, **kwargs):
+                self.assertFalse(pdf_path.exists())
+                pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+                return SimpleNamespace(returncode=1)
+
+            with patch.object(fetcher.shutil, "which", return_value="wkhtmltopdf"), patch.object(
+                fetcher.subprocess, "run", side_effect=render
+            ):
+                fetcher._convert_html_to_pdf("filing.htm", str(pdf_path), allow_failure_if_output=True)
+
+            self.assertTrue(pdf_path.read_bytes().startswith(b"%PDF-"))
+
+    def test_does_not_scan_older_filing_dates(self) -> None:
+        submissions = {"filings": {"recent": {
+            "form": ["8-K", "8-K"],
+            "filingDate": ["2026-09-24", "2020-03-31"],
+            "accessionNumber": ["0000000123-26-000001", "0000000123-20-000001"],
+            "items": ["2.02", "2.02"],
+            "primaryDocument": ["current.htm", "old.htm"],
+        }}}
+        no_exhibits = {"EX-99.1": None, "EX-99.2": None}
+
+        with patch.object(fetcher, "_ticker_to_cik_and_title", return_value=("123", "Test")), patch.object(
+            fetcher, "_load_json", side_effect=[submissions, {}]
+        ) as load_json, patch.object(fetcher, "_http_get", return_value=b""), patch.object(
+            fetcher, "_find_exhibit_files_from_submission", return_value=no_exhibits
+        ), patch.object(fetcher, "_find_exhibit_files", return_value=no_exhibits):
+            result = fetcher.fetch_latest_earnings_8k("TEST", None, ".", "agent", None, False)
+
+        self.assertEqual(1, result)
+        self.assertEqual(2, load_json.call_count)
 
 
 if __name__ == "__main__":
