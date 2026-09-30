@@ -845,7 +845,10 @@ def _is_investing_transcript_url(url: str) -> bool:
     host = (parsed.netloc or "").lower()
     return (
         (host == "investing.com" or host.endswith(".investing.com"))
-        and "/news/transcripts/" in parsed.path
+        and (
+            parsed.path.startswith("/news/transcripts/")
+            or parsed.path.startswith("/news/stock-market-news/earnings-call-transcript-")
+        )
     )
 
 
@@ -938,7 +941,8 @@ def _validate_transcript_identity(
             f"period is Q{identity['q']} FY{identity['fy']}, expected Q{q} FY{fy}",
             identity,
         )
-    if _company_title_score(str(identity["company"]), ticker, company_title) <= 0:
+    company_tokens = _company_tokens(company_title)
+    if company_tokens and _company_title_score(str(identity["company"]), ticker, company_title) <= 0:
         return False, "transcript heading does not identify the requested company", identity
     return True, "exact transcript identity matched", identity
 
@@ -1230,7 +1234,7 @@ def _download_transcript(
     if transcript_url:
         if not _is_investing_transcript_url(transcript_url):
             raise TranscriptSearchError(
-                "--transcript-url must be an Investing.com /news/transcripts/ URL."
+                "--transcript-url must be an Investing.com earnings call transcript URL."
             )
         candidate_list.append(
             {"title": "direct URL", "url": transcript_url, "score": 1000}

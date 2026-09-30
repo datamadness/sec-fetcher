@@ -40,6 +40,22 @@ def transcript_html(
     """
 
 
+class TranscriptUrlTests(unittest.TestCase):
+    def test_accepts_stock_market_transcript(self) -> None:
+        self.assertTrue(fetcher._is_investing_transcript_url(
+            "https://uk.investing.com/news/stock-market-news/"
+            "earnings-call-transcript-carmax-tops-q2-2026-estimates-93CH-4887699"
+        ))
+
+    def test_rejects_news_and_other_hosts(self) -> None:
+        for url in (
+            "https://www.investing.com/news/stock-market-news/carmax-results-123",
+            "https://example.com/news/stock-market-news/earnings-call-transcript-carmax-123",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(fetcher._is_investing_transcript_url(url))
+
+
 class GoogleNewsDiscoveryTests(unittest.TestCase):
     def test_selects_only_exact_company_and_period(self) -> None:
         rss = b"""<?xml version="1.0"?>
@@ -136,6 +152,18 @@ class TranscriptIdentityTests(unittest.TestCase):
         self.assertEqual("COST", identity["ticker"])
         self.assertEqual(1, identity["q"])
         self.assertEqual(2026, identity["fy"])
+
+    def test_accepts_short_company_name_when_ticker_and_period_match(self) -> None:
+        valid, reason, identity = fetcher._validate_transcript_identity(
+            transcript_html(company="HP Inc", ticker="HPQ", q=3, fy=2026),
+            ticker="HPQ",
+            company_title="HP INC",
+            q=3,
+            fy=2026,
+        )
+
+        self.assertTrue(valid, reason)
+        self.assertEqual("HPQ", identity["ticker"])
 
     def test_rejects_previous_period_despite_related_page_text(self) -> None:
         html = transcript_html(
