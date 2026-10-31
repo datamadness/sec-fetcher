@@ -38,7 +38,7 @@ GOOGLE_NEWS_RSS_SEARCH = (
 SEARCH_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 DEFAULT_OUTDIR = "./sec_earnings_8k"
-DEFAULT_SECRETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".secrets")
+DEFAULT_SECRETS_DIR = os.environ.get("SEC_FETCHER_STATE_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".secrets")
 DEFAULT_TRANSCRIPT_COOKIE_FILE = os.path.join(DEFAULT_SECRETS_DIR, "investing.cookie.txt")
 DEFAULT_TRANSCRIPT_BROWSER_PROFILE = os.path.join(DEFAULT_SECRETS_DIR, "investing-browser")
 DEFAULT_TRANSCRIPT_STEM = "earnings_call_transcript"
@@ -429,6 +429,25 @@ def _convert_html_to_pdf(
     extra_args: Optional[list[str]] = None,
     allow_failure_if_output: bool = False,
 ) -> None:
+    # Linux uses the same Chromium installation as transcript retrieval.
+    # Keep the established Windows converter and its arguments unchanged.
+    if sys.platform.startswith("linux"):
+        from pathlib import Path
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.goto(Path(html_path).resolve().as_uri(), wait_until="load")
+                page.emulate_media(media="screen")
+                page.pdf(path=pdf_path, format="A4", print_background=True,
+                         margin={"top": "10mm", "bottom": "10mm",
+                                 "left": "10mm", "right": "10mm"})
+            finally:
+                browser.close()
+        return
+
     wkhtmltopdf = shutil.which("wkhtmltopdf")
     if not wkhtmltopdf:
         raise RuntimeError("wkhtmltopdf not found in PATH")
@@ -537,7 +556,7 @@ _COMPANY_STOP_WORDS = {
 
 
 def _normalize_company_text(value: str) -> str:
-    joined_compounds = re.sub(r"(?<=\w)[&\-](?=\w)", "", value.lower())
+    joined_compounds = re.sub(r"(?<=\w)&(?=\w)", "", value.lower())
     normalized = re.sub(r"[^a-z0-9 ]", " ", joined_compounds)
     return re.sub(r"\b([a-z]{1,3})\s+(\d{1,3})\b", r"\1\2", normalized)
 
@@ -1345,8 +1364,8 @@ def fetch_latest_earnings_8k(
     transcript_cookie_file: Optional[str] = None,
     transcript_cookie: Optional[str] = None,
     transcript_url: Optional[str] = None,
-    transcript_trim_first: int = 1,
-    transcript_trim_last: int = 2,
+    transcript_trim_first: int = (0 if sys.platform.startswith("linux") else 1),
+    transcript_trim_last: int = (0 if sys.platform.startswith("linux") else 2),
     debug: bool = False,
 ) -> int:
     cik, company_title = _ticker_to_cik_and_title(ticker, user_agent, ssl_context)
@@ -1586,7 +1605,7 @@ def main() -> int:
     parser.add_argument(
         "--user-agent",
         help="SEC requires a User-Agent with contact info, e.g. 'Your Name you@email.com'.",
-        default="CodexSecFetcher/1.0 (youremail@example.com)",
+        default=os.environ.get("SEC_FETCHER_USER_AGENT", "CodexSecFetcher/1.0 (youremail@example.com)"),
     )
     parser.add_argument(
         "--ca-bundle",
@@ -1631,14 +1650,14 @@ def main() -> int:
     parser.add_argument(
         "--transcript-trim-first",
         type=int,
-        default=1,
-        help="Trim this many pages from the start of transcript PDFs (default: 1).",
+        default=(0 if sys.platform.startswith("linux") else 1),
+        help="Trim leading transcript PDF pages (default: Linux 0, other platforms 1).",
     )
     parser.add_argument(
         "--transcript-trim-last",
         type=int,
-        default=2,
-        help="Trim this many pages from the end of transcript PDFs (default: 2).",
+        default=(0 if sys.platform.startswith("linux") else 2),
+        help="Trim trailing transcript PDF pages (default: Linux 0, other platforms 2).",
     )
     args = parser.parse_args()
 

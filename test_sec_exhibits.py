@@ -88,6 +88,7 @@ class DirectoryFallbackTests(unittest.TestCase):
 
 
 class FilingFetchTests(unittest.TestCase):
+    @patch.object(fetcher.sys, "platform", "win32")
     def test_keeps_newly_generated_pdf_when_renderer_reports_missing_resource(self) -> None:
         with TemporaryDirectory() as directory:
             pdf_path = Path(directory) / "filing.pdf"

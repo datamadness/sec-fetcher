@@ -23,8 +23,10 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-Optional PDF conversion requires `wkhtmltopdf`:
-- Install `wkhtmltopdf` and ensure it is available in your `PATH`.
+PDF conversion on Linux uses Playwright Chromium, installed with the command above.
+On Windows, PDF conversion keeps using `wkhtmltopdf`; ensure it is on `PATH`.
+Linux conversion uses A4 pages, screen styles, and printed backgrounds. Browser
+errors are reported to the existing caller; Windows renderer options are unchanged.
 
 Transcript PDF trimming (remove first page + last 2 pages) requires `pypdf`:
 - `pip install pypdf`
@@ -249,3 +251,12 @@ Inside the folder:
 
 If `--q`/`--fy` are omitted, the filenames drop the quarter/year prefix:
 - `cost_8k_991.htm`, `cost_8k_992.htm`, `cost_10q.htm` (or `cost_10k.htm`)
+
+## Ubuntu worker configuration
+
+`SEC_FETCHER_STATE_DIR` selects a private writable directory for transcript
+cookies and browser state. Without it, the existing `.secrets` path is retained.
+`SEC_FETCHER_USER_AGENT` provides the default contact User-Agent; the CLI flag
+can still override it. Linux transcript page trimming defaults to zero because
+Chromium pagination differs from wkhtmltopdf. Other platforms retain their
+previous defaults. Explicit trim flags work on both platforms.

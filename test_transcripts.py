@@ -115,6 +115,19 @@ class GoogleNewsDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(1, len(candidates))
 
+    def test_matches_spaced_company_with_hyphenated_headline(self) -> None:
+        rss = b"""<rss><channel><item>
+          <title>Earnings call transcript: Coca-Cola beats Q3 2026 forecasts - Investing.com</title>
+          <link>https://news.google.com/rss/articles/ko?oc=5</link>
+          <source url="https://www.investing.com">Investing.com</source>
+        </item></channel></rss>"""
+
+        candidates = fetcher._parse_google_news_candidates(
+            rss, "KO", "COCA COLA CO", 3, 2026
+        )
+
+        self.assertEqual(1, len(candidates))
+
     def test_resolves_modern_google_news_url(self) -> None:
         page = b'<div data-n-a-sg="signature" data-n-a-ts="1717597091"></div>'
         payload = json.dumps(["garturlres", INVESTING_URL, 1])
@@ -139,6 +152,33 @@ class GoogleNewsDiscoveryTests(unittest.TestCase):
 
 
 class TranscriptIdentityTests(unittest.TestCase):
+    def test_matches_spaced_and_hyphenated_company_names(self) -> None:
+        for expected, actual in (
+            ("COCA COLA CO", "Coca-Cola Co"),
+            ("The Coca-Cola Company", "COCA COLA CO"),
+        ):
+            with self.subTest(expected=expected, actual=actual):
+                valid, reason, _ = fetcher._validate_transcript_identity(
+                    transcript_html(company=actual, ticker="KO", q=3, fy=2026),
+                    ticker="KO", company_title=expected, q=3, fy=2026,
+                )
+                self.assertTrue(valid, reason)
+
+    def test_name_normalization_preserves_identity_guards(self) -> None:
+        for company, ticker, q, fy, reason in (
+            ("Coca-Cola Femsa", "KOF", 3, 2026, "ticker is KOF"),
+            ("Coca-Cola Co", "KO", 2, 2026, "period is Q2 FY2026"),
+            ("Coca-Cola Co", "KO", 3, 2025, "period is Q3 FY2025"),
+            ("PepsiCo", "KO", 3, 2026, "does not identify the requested company"),
+        ):
+            with self.subTest(company=company, ticker=ticker, q=q, fy=fy):
+                valid, message, _ = fetcher._validate_transcript_identity(
+                    transcript_html(company=company, ticker=ticker, q=q, fy=fy),
+                    ticker="KO", company_title="COCA COLA CO", q=3, fy=2026,
+                )
+                self.assertFalse(valid)
+                self.assertIn(reason, message)
+
     def test_accepts_exact_full_transcript_heading(self) -> None:
         valid, reason, identity = fetcher._validate_transcript_identity(
             transcript_html(),
