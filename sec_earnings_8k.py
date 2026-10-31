@@ -1228,6 +1228,130 @@ def _fetch_transcript_page(
     return html_text, final_url, "Playwright"
 
 
+class _ArticleContainerParser(HTMLParser):
+    """Capture known article containers without loading page resources."""
+    VOID = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.stack = []
+        self.parts = None
+        self.level = 0
+        self.articles = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = (attrs.get('class') or '').split()
+        candidate = (attrs.get('data-test') == 'article-content' or
+                     any(c.startswith('article_WYSIWYG') or c == 'WYSIWYG' for c in classes) or
+                     tag == 'article')
+        if self.parts is None and candidate:
+            self.parts = []
+            self.level = len(self.stack)
+        if self.parts is not None:
+            self.parts.append(self.get_starttag_text())
+        if tag not in self.VOID:
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        if self.parts is not None:
+            self.parts.append(self.get_starttag_text())
+
+    def handle_endtag(self, tag):
+        if self.parts is not None:
+            self.parts.append('</' + tag + '>')
+        if tag in self.stack:
+            index = len(self.stack) - 1 - self.stack[::-1].index(tag)
+            self.stack = self.stack[:index]
+        if self.parts is not None and len(self.stack) <= self.level:
+            self.articles.append(''.join(self.parts))
+            self.parts = None
+
+    def handle_data(self, data):
+        if self.parts is not None:
+            self.parts.append(data)
+
+    def handle_entityref(self, name):
+        self.handle_data('&' + name + ';')
+
+    def handle_charref(self, name):
+        self.handle_data('&#' + name + ';')
+
+
+class _PrintArticleParser(HTMLParser):
+    KEEP = {'p', 'h1', 'h2', 'h3', 'h4', 'b', 'strong', 'i', 'em', 'ul', 'ol', 'li',
+            'table', 'thead', 'tbody', 'tr', 'th', 'td', 'br', 'blockquote', 'div', 'section'}
+    SKIP = {'script', 'style', 'nav', 'aside', 'header', 'footer', 'form', 'button', 'iframe', 'svg'}
+
+    def __init__(self):
+        super().__init__()
+        self.skip = []
+        self.parts = []
+        self.text = []
+
+    def handle_starttag(self, tag, attrs):
+        if self.skip:
+            if tag not in _ArticleContainerParser.VOID:
+                self.skip.append(tag)
+            return
+        if tag in self.SKIP:
+            self.skip.append(tag)
+        elif tag in self.KEEP:
+            self.parts.append('<' + tag + '>')
+
+    def handle_endtag(self, tag):
+        if self.skip:
+            if tag in self.skip:
+                index = len(self.skip) - 1 - self.skip[::-1].index(tag)
+                self.skip = self.skip[:index]
+        elif tag in self.KEEP and tag != 'br':
+            self.parts.append('</' + tag + '>')
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(html_lib.escape(data))
+            self.text.append(data)
+
+
+def _prepare_transcript_print_html(html, ticker, company_title, q, fy, source_url):
+    containers = _ArticleContainerParser()
+    containers.feed(html)
+    for article in containers.articles:
+        if not _validate_transcript_identity(article, ticker, company_title, q, fy)[0]:
+            continue
+        printer = _PrintArticleParser()
+        printer.feed(article)
+        expected = ''.join(printer.text)
+        if len(expected.strip()) < 2000:
+            raise ValueError('Transcript article is too short; refusing PDF conversion')
+        body = ''.join(printer.parts)
+        if not _validate_transcript_identity(body, ticker, company_title, q, fy)[0]:
+            raise ValueError('Transcript identity was lost during article extraction')
+        document = ('<!doctype html><html><head><meta charset="utf-8"><style>'
+                    '@page { size:A4; margin:12mm } '
+                    'body { font:11pt/1.45 Arial,sans-serif; color:#111; overflow-wrap:break-word } '
+                    'h1,h2,h3,h4 { break-after:avoid } p { orphans:2; widows:2 } '
+                    'table { border-collapse:collapse; width:100% } td,th { padding:4px } '
+                    '</style></head><body><p>Source: ' + html_lib.escape(source_url) + '</p>' + body + '</body></html>')
+        return document, expected
+    raise ValueError('No article container with the exact transcript identity; refusing whole-page printing')
+
+
+def _validate_transcript_pdf(path, expected_text):
+    from pypdf import PdfReader
+    reader = PdfReader(path)
+    pages = [page.extract_text() or '' for page in reader.pages]
+    compact = lambda value: re.sub(r'\s+', '', value)
+    expected = compact(expected_text)
+    rendered = compact(''.join(pages))
+    if not expected or expected not in rendered:
+        raise ValueError('Transcript PDF does not preserve the complete extracted article text')
+    limit = max(12, (len(expected) + 1199) // 1200 + 5)
+    sparse = sum(len(compact(page)) < 80 for page in pages)
+    if len(pages) > limit or sparse > max(2, len(pages) // 4):
+        raise ValueError(f'Transcript PDF pagination rejected: {len(pages)} pages, {sparse} sparse pages')
+
+
 def _download_transcript(
     ticker: str,
     company_title: str,
@@ -1307,6 +1431,14 @@ def _download_transcript(
             continue
         file_prefix = _file_prefix(ticker, q, fy)
         html_path = os.path.join(out_base, f"{file_prefix}{DEFAULT_TRANSCRIPT_STEM}.html")
+        expected_text = None
+        if save_pdf and sys.platform.startswith("linux"):
+            try:
+                html_text, expected_text = _prepare_transcript_print_html(
+                    html_text, ticker, company_title, q, fy, final_url or url)
+            except ValueError as exc:
+                print(f"Transcript article extraction failed: {exc}")
+                return False
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_text)
         if save_pdf:
@@ -1323,6 +1455,8 @@ def _download_transcript(
                     ],
                     allow_failure_if_output=True,
                 )
+                if expected_text is not None:
+                    _validate_transcript_pdf(pdf_path, expected_text)
                 if trim_first > 0 or trim_last > 0:
                     try:
                         _trim_pdf_pages(pdf_path, trim_first=trim_first, trim_last=trim_last)
@@ -1338,6 +1472,10 @@ def _download_transcript(
             except Exception as exc:
                 print(f"Transcript PDF conversion failed: {exc}")
                 print(f"Transcript HTML retained: {html_path}")
+                if expected_text is not None:
+                    if os.path.exists(pdf_path):
+                        os.remove(pdf_path)
+                    return False
         else:
             print(f"Transcript saved: {html_path}")
         if debug:

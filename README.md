@@ -260,3 +260,11 @@ cookies and browser state. Without it, the existing `.secrets` path is retained.
 can still override it. Linux transcript page trimming defaults to zero because
 Chromium pagination differs from wkhtmltopdf. Other platforms retain their
 previous defaults. Explicit trim flags work on both platforms.
+
+### Linux transcript PDF safeguards
+
+Investing transcripts are extracted from the validated article container before
+printing. Menus, sidebars, scripts, and external styles are excluded. The PDF
+must retain all extracted article text and pass page-count and sparse-page
+checks. Extraction or PDF validation failure stops transcript download rather
+than accepting a whole-site or incomplete PDF. Windows PDF conversion is unchanged.
