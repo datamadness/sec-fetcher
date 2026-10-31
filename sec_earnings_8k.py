@@ -1344,10 +1344,9 @@ def _download_transcript(
             print(f"Transcript source: {final_url} ({method})")
         return True
 
-    print("Transcript download failed: no candidate passed exact identity validation.")
-    if debug:
-        for failure in failures:
-            print(f"  {failure}")
+    print("Transcript download failed: no candidate yielded a validated transcript.")
+    for failure in failures:
+        print(f"  {failure}")
     return False
 
 
