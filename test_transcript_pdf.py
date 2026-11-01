@@ -24,6 +24,15 @@ class TranscriptPdfTests(unittest.TestCase):
         self.assertIn('Complete example answer', clean)
         self.assertIn('Source:', clean)
 
+    def test_publisher_summary_and_ai_footer_are_excluded_but_call_is_complete(self):
+        raw = '<div class="article_WYSIWYG__example"><p>Publisher AI summary.</p>' + HEADER + CONTENT + '<p><em>This article was generated with the support of AI and reviewed by an editor.</em></p></div>'
+        clean, expected = f._prepare_transcript_print_html(raw, 'DASH', 'DoorDash, Inc.', 3, 2026, URL)
+        self.assertNotIn('Publisher AI summary', clean)
+        self.assertNotIn('This article was generated', clean)
+        self.assertIn('Operator: Welcome to the call.', expected)
+        self.assertEqual(expected.count('Complete example answer'), 70)
+        self.assertIn('You may now disconnect.', expected)
+
     def test_wrong_or_missing_article_is_rejected_instead_of_printing_site(self):
         for raw in [HEADER + CONTENT, ARTICLE.replace('Q3 2026','Q2 2026'), '<article>'+HEADER+'<p>Too short</p></article>']:
             with self.subTest(raw=raw[:60]), self.assertRaises(ValueError):

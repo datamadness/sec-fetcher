@@ -1321,10 +1321,24 @@ def _prepare_transcript_print_html(html, ticker, company_title, q, fy, source_ur
             continue
         printer = _PrintArticleParser()
         printer.feed(article)
-        expected = ''.join(printer.text)
-        if len(expected.strip()) < 2000:
-            raise ValueError('Transcript article is too short; refusing PDF conversion')
         body = ''.join(printer.parts)
+        identity = _extract_transcript_identity(article)
+        # Start at the verified Full transcript heading, excluding the publisher's
+        # preceding AI summary. Only known publisher boilerplate ends the section.
+        for heading in re.finditer(r'<h([123])>.*?</h\1>', body, re.S):
+            if _extract_transcript_identity(heading.group())["heading"] == identity["heading"]:
+                body = body[heading.start():]
+                break
+        else:
+            raise ValueError('Verified transcript section boundary was not found')
+        footer = re.search(r'<p>\s*(?:<em>)?\s*This article was generated with the support of AI', body, re.I)
+        if footer:
+            body = body[:footer.start()]
+        transcript = _PrintArticleParser()
+        transcript.feed(body)
+        expected = ''.join(transcript.text)
+        if len(expected.strip()) < 2000:
+            raise ValueError('Transcript section is too short; refusing PDF conversion')
         if not _validate_transcript_identity(body, ticker, company_title, q, fy)[0]:
             raise ValueError('Transcript identity was lost during article extraction')
         document = ('<!doctype html><html><head><meta charset="utf-8"><style>'
