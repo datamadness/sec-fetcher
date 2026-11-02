@@ -39,7 +39,7 @@ SEARCH_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit
 
 DEFAULT_OUTDIR = "./sec_earnings_8k"
 DEFAULT_SECRETS_DIR = os.environ.get("SEC_FETCHER_STATE_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".secrets")
-DEFAULT_TRANSCRIPT_COOKIE_FILE = os.path.join(DEFAULT_SECRETS_DIR, "investing.cookie.txt")
+DEFAULT_TRANSCRIPT_COOKIE_FILE = os.environ.get("SEC_FETCHER_TRANSCRIPT_COOKIE_FILE") or os.path.join(DEFAULT_SECRETS_DIR, "investing.cookie.txt")
 DEFAULT_TRANSCRIPT_BROWSER_PROFILE = os.path.join(DEFAULT_SECRETS_DIR, "investing-browser")
 DEFAULT_TRANSCRIPT_STEM = "earnings_call_transcript"
 
