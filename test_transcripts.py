@@ -57,6 +57,24 @@ class TranscriptUrlTests(unittest.TestCase):
 
 
 class GoogleNewsDiscoveryTests(unittest.TestCase):
+    def test_query_uses_company_without_requiring_ticker_or_article_path(self):
+        self.assertEqual(fetcher._build_transcript_query('XYZ', 'Block, Inc.', 3, 2026),
+                         'site:investing.com block "Q3 2026" "earnings call transcript"')
+
+    def test_query_uses_ticker_when_company_name_is_empty(self):
+        self.assertIn('site:investing.com XYZ ',
+                      fetcher._build_transcript_query('XYZ', '', 3, 2026))
+
+    def test_accepts_canadian_transcript_candidate_without_ticker_in_title(self):
+        rss = b"""<rss><channel><item>
+          <title>Earnings call transcript: Block lifts Q3 2026 outlook - Investing.com Canada</title>
+          <link>https://ca.investing.com/news/stock-market-news/earnings-call-transcript-block-4927403</link>
+          <source url="https://ca.investing.com">Investing.com Canada</source>
+        </item></channel></rss>"""
+        candidates = fetcher._parse_google_news_candidates(rss, 'XYZ', 'Block, Inc.', 3, 2026)
+        self.assertEqual(len(candidates), 1)
+        self.assertIn('/news/stock-market-news/', candidates[0]['url'])
+
     def test_selects_only_exact_company_and_period(self) -> None:
         rss = b"""<?xml version="1.0"?>
         <rss><channel>

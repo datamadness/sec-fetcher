@@ -576,8 +576,8 @@ def _company_search_name(company_title: str) -> str:
 
 def _build_transcript_query(ticker: str, company_title: str, q: int, fy: int) -> str:
     company = _company_search_name(company_title)
-    identity = f"{company} {ticker}" if company else ticker
-    return f'site:investing.com/news/transcripts {identity} "Q{q} {fy}"'
+    identity = company or ticker
+    return f'site:investing.com {identity} "Q{q} {fy}" "earnings call transcript"'
 
 
 def _title_has_period(title: str, q: int, fy: int) -> bool:
