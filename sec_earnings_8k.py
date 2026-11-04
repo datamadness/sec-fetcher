@@ -951,9 +951,6 @@ def _validate_transcript_identity(
     identity = _extract_transcript_identity(html_text)
     if not identity["heading"]:
         return False, "rendered Full transcript heading was not found", identity
-    expected_ticker = _normalize_ticker(ticker)
-    if identity["ticker"] != expected_ticker:
-        return False, f"ticker is {identity['ticker']}, expected {expected_ticker}", identity
     if identity["q"] != q or identity["fy"] != fy:
         return (
             False,
@@ -963,6 +960,9 @@ def _validate_transcript_identity(
     company_tokens = _company_tokens(company_title)
     if company_tokens and _company_title_score(str(identity["company"]), ticker, company_title) <= 0:
         return False, "transcript heading does not identify the requested company", identity
+    expected_ticker = _normalize_ticker(ticker)
+    if identity["ticker"] != expected_ticker:
+        return False, f"ticker is {identity['ticker']}, expected {expected_ticker}", identity
     return True, "exact transcript identity matched", identity
 
 
@@ -1410,6 +1410,7 @@ def _download_transcript(
     if cookie_value:
         _write_cookie_file(cookie_file, cookie_value)
     failures: list[str] = []
+    ticker_mismatches: list[dict] = []
     for candidate in candidate_list:
         url = str(candidate["url"])
         if not transcript_url:
@@ -1440,6 +1441,16 @@ def _download_transcript(
         if not html_text:
             failure = f"{candidate['title']}: {method}"
             failures.append(failure)
+            mismatch = re.fullmatch(r"ticker is ([A-Z0-9.\-]+), expected ([A-Z0-9.\-]+)", method)
+            if mismatch:
+                ticker_mismatches.append({
+                    "requested_ticker": mismatch.group(2),
+                    "source_ticker": mismatch.group(1),
+                    "company": company_title,
+                    "quarter": q,
+                    "fiscal_year": fy,
+                    "url": final_url or url,
+                })
             if debug:
                 print(f"  Rejected: {method}")
             continue
@@ -1499,6 +1510,12 @@ def _download_transcript(
     print("Transcript download failed: no candidate yielded a validated transcript.")
     for failure in failures:
         print(f"  {failure}")
+    for mismatch in ticker_mismatches:
+        print("TRANSCRIPT_TICKER_MISMATCH " + json.dumps(mismatch))
+    if ticker_mismatches:
+        print("Codex recovery: verify the source ticker belongs to the same issuer and event "
+              "using primary sources, then retry only the transcript fetch with that ticker. "
+              "Keep the episode ticker unchanged. Do not bypass company or period validation.")
     return False
 
 
