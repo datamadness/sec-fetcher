@@ -1571,8 +1571,8 @@ def _download_transcript(
                 html_text, expected_text = _prepare_transcript_print_html(
                     html_text, ticker, company_title, q, fy, final_url or url)
             except ValueError as exc:
-                print(f"Transcript article extraction failed: {exc}")
-                return False
+                failures.append(f"{candidate['title']}: transcript article extraction failed: {exc}")
+                continue
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_text)
         if save_pdf:
@@ -1609,7 +1609,8 @@ def _download_transcript(
                 if expected_text is not None:
                     if os.path.exists(pdf_path):
                         os.remove(pdf_path)
-                    return False
+                    failures.append(f"{candidate['title']}: transcript PDF validation failed: {exc}")
+                    continue
         else:
             print(f"Transcript saved: {html_path}")
         if debug:
