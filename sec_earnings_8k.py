@@ -686,7 +686,10 @@ def _search_investing_transcripts(
 def _resolve_google_news_url(
     article_url: str,
     ssl_context: Optional[ssl.SSLContext],
+    url_validator=None,
 ) -> Optional[str]:
+    if url_validator is None:
+        url_validator = _is_investing_transcript_url
     parsed = urllib.parse.urlparse(article_url)
     if parsed.netloc != "news.google.com" or "/rss/articles/" not in parsed.path:
         return article_url
@@ -786,7 +789,7 @@ def _resolve_google_news_url(
                 continue
             if payload and payload[0] == "garturlres":
                 resolved = str(payload[1])
-                return resolved if _is_investing_transcript_url(resolved) else None
+                return resolved if url_validator(resolved) else None
     return None
 
 
@@ -1387,22 +1390,28 @@ def _alternate_transcript_source(url):
 
 def _alternate_transcript_urls(ticker, company_title, q, fy, ssl_context):
     for host in _ALTERNATE_TRANSCRIPT_SOURCES:
-        query = f'site:{host} {company_title} {ticker} "Q{q}" "{fy}" "earnings call transcript"'
+        scope = f'{host}/quote/{ticker}/earnings' if host == 'finance.yahoo.com' else host
+        query = f'site:{scope} {" ".join(_company_tokens(company_title))} {ticker} "Q{q}" "{fy}" "earnings call transcript"'
         search_url = GOOGLE_NEWS_RSS_SEARCH.format(query=urllib.parse.quote_plus(query))
         try:
             rss = ElementTree.fromstring(_http_get(search_url, SEARCH_USER_AGENT, ssl_context))
         except (OSError, ElementTree.ParseError) as exc:
             print(f'Transcript discovery failed for {host}: {exc}')
             continue
-        for item in rss.findall('./channel/item')[:5]:
+        matches = 0
+        for item in rss.findall('./channel/item'):
             title = item.findtext('title') or ''
             if not _title_has_period(title, q, fy) or not _company_title_score(title, ticker, company_title):
                 continue
             link = item.findtext('link')
             if link:
-                url = _resolve_google_news_url(link, ssl_context) or link
-                if _alternate_transcript_source(url):
+                matches += 1
+                url = _resolve_google_news_url(link, ssl_context, _alternate_transcript_source)
+                source = _alternate_transcript_source(url) if url else None
+                if source and source[0] == host:
                     yield url
+                if matches >= 5:
+                    break
 
 
 def _alternate_transcript_html(url, ticker, company_title, q, fy, ssl_context):
