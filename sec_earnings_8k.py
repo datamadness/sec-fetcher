@@ -1366,6 +1366,85 @@ def _validate_transcript_pdf(path, expected_text):
         raise ValueError(f'Transcript PDF pagination rejected: {len(pages)} pages, {sparse} sparse pages')
 
 
+_ALTERNATE_TRANSCRIPT_SOURCES = {
+    'benzinga.com': ('/news/', '.article-content-body-only'),
+    'finance.yahoo.com': ('/quote/', '.transcriptContainer'),
+}
+
+
+def _alternate_transcript_source(url):
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or '').removeprefix('www.')
+    source = _ALTERNATE_TRANSCRIPT_SOURCES.get(host)
+    if (source and parsed.scheme == 'https' and not parsed.username
+            and not parsed.password and parsed.port in (None, 443)
+            and parsed.path.startswith(source[0])
+            and (host != 'finance.yahoo.com' or re.fullmatch(
+                r'/quote/[^/]+/earnings/[^/]+[.]html', parsed.path))):
+        return host, source[1]
+    return None
+
+
+def _alternate_transcript_urls(ticker, company_title, q, fy, ssl_context):
+    for host in _ALTERNATE_TRANSCRIPT_SOURCES:
+        query = f'site:{host} {company_title} {ticker} "Q{q}" "{fy}" "earnings call transcript"'
+        search_url = GOOGLE_NEWS_RSS_SEARCH.format(query=urllib.parse.quote_plus(query))
+        try:
+            rss = ElementTree.fromstring(_http_get(search_url, SEARCH_USER_AGENT, ssl_context))
+        except (OSError, ElementTree.ParseError) as exc:
+            print(f'Transcript discovery failed for {host}: {exc}')
+            continue
+        for item in rss.findall('./channel/item')[:5]:
+            title = item.findtext('title') or ''
+            if not _title_has_period(title, q, fy) or not _company_title_score(title, ticker, company_title):
+                continue
+            link = item.findtext('link')
+            if link:
+                url = _resolve_google_news_url(link, ssl_context) or link
+                if _alternate_transcript_source(url):
+                    yield url
+
+
+def _alternate_transcript_html(url, ticker, company_title, q, fy, ssl_context):
+    from bs4 import BeautifulSoup
+
+    host, selector = _alternate_transcript_source(url)
+    if host == 'benzinga.com':
+        parsed = urllib.parse.urlparse(url)
+        url = parsed._replace(netloc=host).geturl()
+    content, final_url = _impersonated_http_get(url, {}, ssl_context)
+    if _alternate_transcript_source(final_url) != (host, selector):
+        raise ValueError('Transcript redirected outside the requested publisher')
+    page = BeautifulSoup(content, 'html.parser')
+    article = page.select_one(selector)
+    title = page.title.get_text(' ', strip=True) if page.title else ''
+    heading = page.h1.get_text(' ', strip=True) if page.h1 else title
+    title_tokens = set(_normalize_company_text(title).split())
+    if (not article or not _title_has_period(heading, q, fy)
+            or not set(_company_tokens(company_title)).issubset(title_tokens)
+            or not re.search(rf'(?<![\w.-]){re.escape(ticker)}(?![\w.-])', title, re.I)):
+        raise ValueError('Alternate transcript identity does not match the requested issuer and period')
+    if host == 'benzinga.com':
+        full = article.find(['h2', 'h3', 'h4'], string=re.compile(r'^Full Transcript$', re.I))
+        if full is None:
+            raise ValueError('Full transcript heading is missing')
+        body = ''.join(str(tag) for tag in full.next_siblings)
+    else:
+        body = str(article)
+    printer = _PrintArticleParser()
+    printer.feed(body)
+    expected = ''.join(printer.text)
+    if (len(expected.strip()) < 2000
+            or not re.search(r'question[\s–—-]+and[\s–—-]+answer|first question|open.{0,25}for questions', expected, re.I)
+            or not re.search(r'conclud.{0,50}(?:call|conference)|may now disconnect', expected, re.I)):
+        raise ValueError('Alternate transcript lacks the expected Q&A or closing remarks')
+    document = ('<!doctype html><meta charset="utf-8"><style>'
+                'body {font:11pt/1.45 Arial,sans-serif;overflow-wrap:break-word}'
+                '</style><h1>' + html_lib.escape(heading) + '</h1><p>Source: '
+                + html_lib.escape(final_url) + '</p>' + ''.join(printer.parts))
+    return document, expected, final_url
+
+
 def _download_transcript(
     ticker: str,
     company_title: str,
@@ -1389,31 +1468,40 @@ def _download_transcript(
 
     candidate_list: list[dict] = []
     if transcript_url:
-        if not _is_investing_transcript_url(transcript_url):
+        if not (_is_investing_transcript_url(transcript_url) or _alternate_transcript_source(transcript_url)):
             raise TranscriptSearchError(
-                "--transcript-url must be an Investing.com earnings call transcript URL."
+                "--transcript-url must be an Investing, Benzinga or Yahoo Finance transcript URL."
             )
         candidate_list.append(
             {"title": "direct URL", "url": transcript_url, "score": 1000}
         )
     else:
-        candidate_list = _search_investing_transcripts(
-            ticker=ticker,
-            company_title=company_title,
-            q=q,
-            fy=fy,
-            ssl_context=ssl_context,
-            debug=debug,
-        )
+        try:
+            candidate_list = _search_investing_transcripts(
+                ticker=ticker,
+                company_title=company_title,
+                q=q,
+                fy=fy,
+                ssl_context=ssl_context,
+                debug=debug,
+            )
+        except TranscriptSearchError as exc:
+            print(exc)
+
+    def candidates():
+        yield from candidate_list
+        if not transcript_url:
+            for url in _alternate_transcript_urls(ticker, company_title, q, fy, ssl_context):
+                yield {"title": "alternate transcript", "url": url, "resolved": True}
 
     cookie_file = transcript_cookie_file or DEFAULT_TRANSCRIPT_COOKIE_FILE
     if cookie_value:
         _write_cookie_file(cookie_file, cookie_value)
     failures: list[str] = []
     ticker_mismatches: list[dict] = []
-    for candidate in candidate_list:
+    for candidate in candidates():
         url = str(candidate["url"])
-        if not transcript_url:
+        if not transcript_url and not candidate.get("resolved"):
             resolved_url = _resolve_google_news_url(url, ssl_context)
             if resolved_url:
                 url = resolved_url
@@ -1421,23 +1509,36 @@ def _download_transcript(
                     print(f"  Resolved Investing.com URL: {url}")
             elif debug:
                 print("  Google News URL resolution failed; browser navigation will be attempted.")
-        cookie = cookie_value or _read_cookie_file(
-            cookie_file, "https://www.investing.com/news/transcripts/"
-        )
-        if debug:
-            print(f"Trying transcript candidate: {candidate['title']}")
-            print(f"  URL: {url}")
-        html_text, final_url, method = _fetch_transcript_page(
-            url=url,
-            ticker=ticker,
-            company_title=company_title,
-            q=q,
-            fy=fy,
-            user_agent=user_agent,
-            ssl_context=ssl_context,
-            cookie=cookie,
-            debug=debug,
-        )
+        expected_text = None
+        alternate = _alternate_transcript_source(url)
+        if alternate:
+            try:
+                html_text, expected_text, final_url = _alternate_transcript_html(
+                    url, ticker, company_title, q, fy, ssl_context)
+                method = alternate[0]
+            except Exception as exc:
+                failures.append(f"{alternate[0]}: {exc}")
+                continue
+        else:
+            if candidate.get("resolved"):
+                continue
+            cookie = cookie_value or _read_cookie_file(
+                cookie_file, "https://www.investing.com/news/transcripts/"
+            )
+            if debug:
+                print(f"Trying transcript candidate: {candidate['title']}")
+                print(f"  URL: {url}")
+            html_text, final_url, method = _fetch_transcript_page(
+                url=url,
+                ticker=ticker,
+                company_title=company_title,
+                q=q,
+                fy=fy,
+                user_agent=user_agent,
+                ssl_context=ssl_context,
+                cookie=cookie,
+                debug=debug,
+            )
         if not html_text:
             failure = f"{candidate['title']}: {method}"
             failures.append(failure)
@@ -1456,8 +1557,7 @@ def _download_transcript(
             continue
         file_prefix = _file_prefix(ticker, q, fy)
         html_path = os.path.join(out_base, f"{file_prefix}{DEFAULT_TRANSCRIPT_STEM}.html")
-        expected_text = None
-        if save_pdf and sys.platform.startswith("linux"):
+        if save_pdf and not alternate and sys.platform.startswith("linux"):
             try:
                 html_text, expected_text = _prepare_transcript_print_html(
                     html_text, ticker, company_title, q, fy, final_url or url)
@@ -1482,7 +1582,7 @@ def _download_transcript(
                 )
                 if expected_text is not None:
                     _validate_transcript_pdf(pdf_path, expected_text)
-                if trim_first > 0 or trim_last > 0:
+                if not alternate and (trim_first > 0 or trim_last > 0):
                     try:
                         _trim_pdf_pages(pdf_path, trim_first=trim_first, trim_last=trim_last)
                     except Exception as exc:
